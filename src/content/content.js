@@ -1,0 +1,1269 @@
+// content.js
+// 运行在 BOSS 直聘职位搜索页 (https://www.zhipin.com/web/geek/job*) 上，
+// 负责实际的"搜索匹配职位 -> 智能打分 -> 打招呼 -> 投递"自动化流程。
+//
+// 相比 v1 的关键改动（都是针对实际使用中暴露的问题）：
+// 1) 匹配不再只看"标题+标签"：会去抓职位详情正文（同源 fetch，不跳页），JD 参与关键词匹配；
+// 2) 新增大模型打分：把"你的求职画像 + 职位信息 + JD"交给模型判 0-100 分，
+//    低于阈值就跳过，并记录理由（模型调用在 background 里做，这里只发消息）；
+// 3) 翻页健壮化：点击后校验"卡片列表签名/地址"是否真的变了，不再固定盲等 1500ms；
+// 4) 页面导航续跑：如果翻页导致整页刷新把脚本上下文销毁，下次注入时能自动接着上次进度；
+// 5) 定时刷新捞新岗位：一轮翻完可以等 N 分钟重新搜索，靠历史记录只投没投过的。
+//
+// 设计要点：
+// - 完全基于当前已登录的页面 DOM 操作，不读取、不上传任何账号 / Cookie 信息。
+//   （唯一的外发请求是用户自己配置的大模型接口，内容只有职位信息 + 你填的画像）
+// - 状态保存在模块级对象里，独立于 popup 是否打开；
+//   进度上报给 background，popup 打开时拉取最新状态，中途关闭 popup 不会丢进度。
+
+(function () {
+  const SEL = window.__BOSS_SELECTORS__ || (typeof BOSS_SELECTORS !== 'undefined' ? BOSS_SELECTORS : null);
+  const MATCH = typeof matchJob !== 'undefined' ? matchJob : null;
+  const PARSE_SALARY = typeof parseSalaryRange !== 'undefined' ? parseSalaryRange : null;
+  const SIG = typeof listSignatureOf === 'function' ? listSignatureOf : (hrefs) => (hrefs || []).join('|');
+  const SHOULD_APPLY = typeof shouldApply === 'function' ? shouldApply : null;
+  const CLASSIFY = typeof classifyDetailFetch === 'function' ? classifyDetailFetch : null;
+
+  const STORAGE_KEY_SEEN = 'ba_seen_job_ids';
+  const STORAGE_KEY_RUN = 'ba_run_state';
+  const RUN_STATE_TTL_MS = 5 * 60 * 1000; // 超过 5 分钟的续跑状态视为过期
+  const SCORE_TIMEOUT_MS = 45000;
+
+  const state = {
+    running: false,
+    appliedCount: 0,
+    skippedCount: 0,
+    errorCount: 0,
+    scoredCount: 0,
+    aiFailCount: 0,
+    log: [],
+    config: null,
+    stopRequested: false,
+    startedAt: 0,
+    keepAliveTimer: null,
+    jdCache: new Map(),
+    salaryWarned: false,
+    jdBlockedCount: 0
+  };
+
+  // ---------- 基础工具 ----------
+  function log(message, level = 'info') {
+    const entry = { time: new Date().toLocaleTimeString('zh-CN', { hour12: false }), message, level };
+    state.log.push(entry);
+    if (state.log.length > 300) state.log.shift();
+    reportProgress();
+    // eslint-disable-next-line no-console
+    console.log(`[BOSS自动投递] ${entry.time} ${message}`);
+  }
+
+  function reportProgress() {
+    chrome.runtime.sendMessage({
+      type: 'BA_PROGRESS',
+      payload: {
+        running: state.running,
+        appliedCount: state.appliedCount,
+        skippedCount: state.skippedCount,
+        errorCount: state.errorCount,
+        scoredCount: state.scoredCount,
+        aiFailCount: state.aiFailCount,
+        log: state.log.slice(-50)
+      }
+    }).catch(() => {});
+  }
+
+  function snapshotState() {
+    return {
+      running: state.running,
+      appliedCount: state.appliedCount,
+      skippedCount: state.skippedCount,
+      errorCount: state.errorCount,
+      scoredCount: state.scoredCount,
+      aiFailCount: state.aiFailCount,
+      log: state.log.slice(-50)
+    };
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // 可被"停止"打断的等待（用于定时刷新的长等待）
+  async function interruptibleSleep(ms) {
+    const step = 500;
+    let waited = 0;
+    while (waited < ms && !state.stopRequested) {
+      await sleep(Math.min(step, ms - waited));
+      waited += step;
+    }
+  }
+
+  function randomDelay(minMs, maxMs) {
+    const lo = Math.max(300, minMs || 3000);
+    const hi = Math.max(lo, maxMs || 8000);
+    return lo + Math.random() * (hi - lo);
+  }
+
+  async function waitFor(conditionFn, { timeout = 8000, interval = 200 } = {}) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      if (state.stopRequested) return null;
+      const result = conditionFn();
+      if (result) return result;
+      await sleep(interval);
+    }
+    return null;
+  }
+
+  function queryFirst(root, selectors) {
+    for (const sel of selectors) {
+      const el = root.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
+  }
+
+  function queryAllFirst(root, selectors) {
+    for (const sel of selectors) {
+      const els = root.querySelectorAll(sel);
+      if (els && els.length > 0) return Array.from(els);
+    }
+    return [];
+  }
+
+  function findByText(root, tagSelector, textIncludesList) {
+    const candidates = Array.from(root.querySelectorAll(tagSelector));
+    return candidates.find((el) => {
+      const t = (el.textContent || '').trim();
+      return textIncludesList.some((needle) => t.includes(needle));
+    }) || null;
+  }
+
+  // ---------- 续跑状态（跨页面导航） ----------
+  async function persistRunState() {
+    if (!state.config || !state.startedAt) return;
+    await chrome.storage.local.set({
+      [STORAGE_KEY_RUN]: {
+        config: state.config,
+        appliedCount: state.appliedCount,
+        skippedCount: state.skippedCount,
+        errorCount: state.errorCount,
+        scoredCount: state.scoredCount,
+        aiFailCount: state.aiFailCount,
+        startedAt: state.startedAt,
+        stopRequested: state.stopRequested,
+        updatedAt: Date.now()
+      }
+    }).catch(() => {});
+  }
+
+  async function clearRunState() {
+    await chrome.storage.local.remove(STORAGE_KEY_RUN).catch(() => {});
+  }
+
+  async function readRunState() {
+    const data = await chrome.storage.local.get(STORAGE_KEY_RUN);
+    return data[STORAGE_KEY_RUN] || null;
+  }
+
+  // ---------- 职位卡片读取 ----------
+  function getJobCards() {
+    const container = queryFirst(document, SEL.jobListContainer) || document.body;
+    return queryAllFirst(container, SEL.jobCard);
+  }
+
+  function getCardHref(card) {
+    for (const sel of SEL.cardLink || ['a[href]']) {
+      const a = card.querySelector(sel);
+      const href = a && a.getAttribute('href');
+      if (href) return href;
+    }
+    return '';
+  }
+
+  function currentListSignature() {
+    return SIG(getJobCards().map(getCardHref));
+  }
+
+  function buildJobId(href, title, company, salary) {
+    // 职位详情链接通常带有 lid / securityId 等每次搜索都会变化的追踪参数，
+    // 必须只取路径部分作为稳定 ID，否则同一个职位每次搜索都会被当成"新职位"，
+    // 导致重复打招呼。
+    if (href) {
+      try {
+        const url = new URL(href, window.location.href);
+        if (url.pathname && url.pathname !== '/') return url.pathname;
+      } catch (e) {
+        // 不是合法 URL，走兜底方案
+      }
+    }
+    return `${title}__${company}__${salary}`;
+  }
+
+  function extractJobInfo(card) {
+    const titleEl = queryFirst(card, SEL.jobTitle);
+    const companyEl = queryFirst(card, SEL.companyName);
+    const salaryEl = queryFirst(card, SEL.jobSalary);
+    const tagsEls = queryAllFirst(card, SEL.jobTags);
+    const href = getCardHref(card);
+
+    const title = titleEl ? titleEl.textContent.trim() : '';
+    const company = companyEl ? companyEl.textContent.trim() : '';
+    const salary = salaryEl ? salaryEl.textContent.trim() : '';
+    const tagsText = tagsEls.map((el) => el.textContent.trim()).join(' ');
+    const jobId = buildJobId(href, title, company, salary);
+
+    return { jobId, title, company, salary, tagsText, href };
+  }
+
+  async function loadSeenIds() {
+    const data = await chrome.storage.local.get(STORAGE_KEY_SEEN);
+    return new Set(data[STORAGE_KEY_SEEN] || []);
+  }
+
+  async function markSeen(jobId) {
+    const data = await chrome.storage.local.get(STORAGE_KEY_SEEN);
+    const list = data[STORAGE_KEY_SEEN] || [];
+    if (!list.includes(jobId)) {
+      list.push(jobId);
+      if (list.length > 5000) list.splice(0, list.length - 5000);
+      await chrome.storage.local.set({ [STORAGE_KEY_SEEN]: list });
+    }
+  }
+
+  // ---------- 拟人化输入 / 点击 ----------
+  function setNativeValue(element, value) {
+    const proto = element.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (descriptor && descriptor.set) {
+      descriptor.set.call(element, value);
+    } else {
+      element.value = value;
+    }
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  // 逐字符"打字"，而不是一次性把整段文字塞进输入框，这样在页面上能看到文字
+  // 一个字一个字冒出来，也顺带让单次操作耗时更接近真人手速。
+  async function typeLikeHuman(element, text) {
+    setNativeValue(element, '');
+    await sleep(randomDelay(200, 400));
+    let current = '';
+    for (const ch of text) {
+      if (state.stopRequested) return;
+      current += ch;
+      setNativeValue(element, current);
+      await sleep(30 + Math.random() * 70);
+    }
+    await sleep(randomDelay(300, 600));
+  }
+
+  // 给即将点击的元素画一圈短暂的高亮框，方便肉眼看到插件正在点哪个按钮。
+  function highlightElement(el, duration = 900) {
+    if (!el || !el.style) return;
+    const prevOutline = el.style.outline;
+    const prevOffset = el.style.outlineOffset;
+    el.style.outline = '2px solid #ff4757';
+    el.style.outlineOffset = '2px';
+    setTimeout(() => {
+      el.style.outline = prevOutline;
+      el.style.outlineOffset = prevOffset;
+    }, duration);
+  }
+
+  // 统一的"人类式点击"：平滑滚动到元素可见位置，停顿一下，高亮，再停顿一下，
+  // 最后才点击——让每一步操作在页面上都清晰可辨，而不是瞬间完成看不出发生了什么。
+  async function humanClick(el) {
+    if (!el) return false;
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    await sleep(randomDelay(400, 900));
+    if (state.stopRequested) return false;
+    highlightElement(el);
+    await sleep(randomDelay(250, 600));
+    if (state.stopRequested) return false;
+    el.click();
+    await sleep(randomDelay(200, 500));
+    return true;
+  }
+
+  function isCardAlreadyChatted(card) {
+    const text = card.textContent || '';
+    return SEL.alreadyChattedTextHints.some((hint) => text.includes(hint));
+  }
+
+  // ---------- 职位详情（JD）抓取 ----------
+  /**
+   * 用同源 fetch 拿详情页 HTML 并解析出职位描述。
+   *
+   * 为什么不直接点开卡片：点开往往会触发整页跳转，content script 当场被销毁，
+   * 任务静默死掉（v1 就是这样丢任务的）。fetch 不会影响当前页面，也不打断节奏。
+   */
+  async function fetchJdInfo(info) {
+    if (!info || !info.href) return { jd: '', salaryHint: '', blocked: false };
+    if (state.jdCache.has(info.jobId)) return state.jdCache.get(info.jobId);
+
+    let text = '';
+    let salaryHint = '';
+    let blocked = false;
+    let note = '';
+
+    try {
+      const abs = new URL(info.href, location.href);
+      if (!/(^|\.)zhipin\.com$/.test(abs.hostname)) return { jd: '', salaryHint: '', blocked: false };
+      if (!/\/job_detail\//.test(abs.pathname)) return { jd: '', salaryHint: '', blocked: false };
+
+      // 保留链接上的 securityId / lid 等参数。
+      // 之前为了"jobId 稳定"把 query 全删了（jobId 本来就只取 pathname，不需要删），
+      // 结果详情页少了这些参数，更容易被服务端判成异常访问。
+      abs.hash = '';
+
+      await sleep(randomDelay(300, 900));
+
+      const res = await fetch(abs.href, {
+        credentials: 'include',
+        headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+        referrer: location.href,
+        referrerPolicy: 'strict-origin-when-cross-origin'
+      });
+
+      const finalUrl = res.url || abs.href;
+      const redirectToLogin = /(login|passport|verify|safe-?check)/i.test(finalUrl);
+
+      if (!res.ok) {
+        note = `HTTP ${res.status}${redirectToLogin ? '，且被重定向到登录/验证页' : ''}`;
+        blocked = redirectToLogin || res.status === 403 || res.status === 429;
+      } else {
+        const html = await res.text();
+
+        // 先解析正文：只要拿到正文就不算被拦。
+        // 之前是先搜"安全/验证"等字样，而 BOSS 的 JS 里本身就带 security-check 这类字符串，
+        // 于是正常页面被误判成"被风控拦截"，白白丢弃了本可以拿到的 JD。
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const parts = [];
+        for (const sel of SEL.jdDetail || []) {
+          const nodes = doc.querySelectorAll(sel);
+          if (nodes.length) {
+            nodes.forEach((n) => parts.push((n.textContent || '').trim()));
+            break;
+          }
+        }
+        text = parts.join('\n').replace(/[ \t]+/g, ' ').replace(/\n{2,}/g, '\n').trim();
+
+        const outcome = CLASSIFY
+          ? CLASSIFY({ jdText: text, html, finalUrl, hints: SEL.detailBlockedHints })
+          : (text.length >= 20 ? 'ok' : 'empty');
+
+        if (outcome === 'ok') {
+          state.jdBlockedCount = 0;
+          const detailText = (doc.body ? doc.body.textContent : '').replace(/\s+/g, ' ');
+          const rangeMatch = detailText.match(/(\d{1,3})\s*-\s*(\d{1,3})\s*K/i);
+          if (rangeMatch) {
+            salaryHint = `${rangeMatch[1]}-${rangeMatch[2]}K`;
+          } else {
+            const aboveMatch = detailText.match(/(\d{1,3})\s*K\s*以上/i);
+            if (aboveMatch) salaryHint = `${aboveMatch[1]}K以上`;
+          }
+        } else if (outcome === 'blocked') {
+          blocked = true;
+          note = `被重定向到登录/验证页或被验证页替换（最终地址 ${finalUrl.slice(0, 90)}）`;
+        } else {
+          note = `未解析到职位描述（HTML ${html.length} 字节，可能是前端渲染或选择器变化）`;
+        }
+      }
+    } catch (e) {
+      note = e.message;
+    }
+
+    if (blocked) {
+      state.jdBlockedCount = (state.jdBlockedCount || 0) + 1;
+      log(`抓取职位详情失败：${note}；本次降级为只用列表信息`, 'warn');
+      if (state.jdBlockedCount >= 3) {
+        const pause = Math.min(20000, 4000 * (state.jdBlockedCount - 2));
+        log(`连续 ${state.jdBlockedCount} 次取详情失败，暂停约 ${Math.round(pause / 1000)} 秒再继续（避免加重风控）`, 'warn');
+        await interruptibleSleep(pause);
+      }
+      // 被拦的结果不写缓存：这一轮后面或下次运行还有机会重新抓
+      return { jd: '', salaryHint: '', blocked: true };
+    }
+
+    if (text.length > 6000) text = text.slice(0, 6000);
+    const out = { jd: text, salaryHint, blocked: false };
+    state.jdCache.set(info.jobId, out);
+    return out;
+  }
+
+  // ---------- 大模型打分（经 background 代理） ----------
+  function sendWithTimeout(message, timeoutMs) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve({ ok: false, error: `等待后台响应超时（>${Math.round(timeoutMs / 1000)}s）` });
+        }
+      }, timeoutMs);
+      try {
+        chrome.runtime.sendMessage(message).then((r) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(r || { ok: false, error: '后台没有返回内容' });
+        }).catch((e) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ ok: false, error: e.message });
+        });
+      } catch (e) {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve({ ok: false, error: e.message });
+        }
+      }
+    });
+  }
+
+  async function scoreViaAi(info, jd) {
+    const resp = await sendWithTimeout({ type: 'BA_SCORE', job: info, jd }, SCORE_TIMEOUT_MS);
+    if (!resp || !resp.ok) return { ok: false, error: (resp && resp.error) || '未知错误' };
+    return { ok: true, cached: !!resp.cached, result: resp.result };
+  }
+
+  function startKeepAlive() {
+    if (state.keepAliveTimer) return;
+    // 每 20 秒 ping 一次后台，避免打分请求进行到一半时 service worker 被回收
+    state.keepAliveTimer = setInterval(() => {
+      chrome.runtime.sendMessage({ type: 'BA_PING' }).catch(() => {});
+    }, 20000);
+  }
+
+  function stopKeepAlive() {
+    if (state.keepAliveTimer) {
+      clearInterval(state.keepAliveTimer);
+      state.keepAliveTimer = null;
+    }
+  }
+
+  // ---------- 搜索与原生筛选 ----------
+  async function performSearch(keyword) {
+    const input = await waitFor(() => queryFirst(document, SEL.searchInput), { timeout: 5000 });
+    if (!input) {
+      log('未找到页面搜索框，将直接使用当前页面已有的职位列表（如需按关键词搜索，请先手动在 BOSS 搜索框中搜索）', 'warn');
+      return false;
+    }
+
+    await humanClick(input);
+    input.focus();
+    await typeLikeHuman(input, keyword);
+
+    const searchBtn = queryFirst(document, SEL.searchButton);
+    if (searchBtn) {
+      await humanClick(searchBtn);
+    } else {
+      await sleep(randomDelay(200, 500));
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+    }
+
+    const ok = await waitFor(() => getJobCards().length > 0, { timeout: 10000 });
+    if (!ok) {
+      log(`搜索「${keyword}」后未加载出职位列表，请确认关键词是否有结果`, 'warn');
+      return false;
+    }
+    await sleep(800);
+    return true;
+  }
+
+  async function applySalaryFilter(minK, maxK) {
+    if (!minK && !maxK) return; // 用户没设置薪资范围，保持"不限"
+    if (!PARSE_SALARY) return;
+
+    const trigger = findByText(document, 'div, span, button, a', SEL.salaryFilterTriggerTexts);
+    if (!trigger) {
+      log('未找到"薪资待遇"筛选按钮，跳过原生筛选设置（仍会按薪资对已加载的结果做二次过滤）', 'warn');
+      return;
+    }
+
+    await humanClick(trigger);
+
+    const panel = await waitFor(() => queryFirst(document, SEL.filterDropdownPanel), { timeout: 3000 }) || document;
+    const optionEls = queryAllFirst(panel, SEL.filterOptionItem).filter((el) => (el.textContent || '').trim());
+
+    const lo = minK || 0;
+    const hi = maxK || Infinity;
+    let bestEl = null;
+    let bestOverlap = -Infinity;
+    for (const el of optionEls) {
+      const range = PARSE_SALARY(el.textContent.trim());
+      if (!range) continue;
+      const overlap = Math.min(range.max, hi) - Math.max(range.min, lo);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestEl = el;
+      }
+    }
+
+    if (!bestEl) {
+      log('未能在薪资筛选选项里找到可解析的档位，跳过原生筛选设置', 'warn');
+      await humanClick(trigger); // 尝试收起面板
+      return;
+    }
+
+    const chosenText = bestEl.textContent.trim();
+    await humanClick(bestEl);
+
+    const confirmBtn = findByText(document, 'button, span, a', SEL.filterConfirmButtonTexts);
+    if (confirmBtn) await humanClick(confirmBtn);
+
+    await waitFor(() => getJobCards().length > 0, { timeout: 6000 });
+    log(`已应用薪资筛选：${chosenText}`);
+  }
+
+  async function selectDropdownFilterByText(triggerTexts, desiredText, filterLabel) {
+    if (!desiredText) return; // "不限"，不调整
+
+    const trigger = findByText(document, 'div, span, button, a', triggerTexts);
+    if (!trigger) {
+      log(`未找到"${filterLabel}"筛选按钮，跳过`, 'warn');
+      return;
+    }
+
+    await humanClick(trigger);
+
+    const panel = await waitFor(() => queryFirst(document, SEL.filterDropdownPanel), { timeout: 3000 }) || document;
+    const optionEls = queryAllFirst(panel, SEL.filterOptionItem).filter((el) => (el.textContent || '').trim());
+
+    const target =
+      optionEls.find((el) => el.textContent.trim() === desiredText) ||
+      optionEls.find((el) => el.textContent.trim().includes(desiredText));
+
+    if (!target) {
+      log(`"${filterLabel}"筛选选项里没有找到「${desiredText}」，跳过（可能选项文案与页面实际不一致，可在 selectors.js 里核对）`, 'warn');
+      await humanClick(trigger);
+      return;
+    }
+
+    await humanClick(target);
+
+    const confirmBtn = findByText(document, 'button, span, a', SEL.filterConfirmButtonTexts);
+    if (confirmBtn) await humanClick(confirmBtn);
+
+    await waitFor(() => getJobCards().length > 0, { timeout: 6000 });
+    log(`已应用"${filterLabel}"筛选：${desiredText}`);
+  }
+
+  // 清掉可能挡在流程中间的通用弹窗（完善简历提示、活动广告等）。
+  // 专门处理"已向BOSS发送消息"确认框的逻辑在 sendGreeting 里，这里只处理其余的。
+  async function dismissGenericDialog() {
+    const closeBtn = findByText(document, 'button, span, a, i, div', SEL.genericDialogCloseTexts);
+    if (closeBtn) {
+      await humanClick(closeBtn);
+      return true;
+    }
+    const closeIcon = queryFirst(document, SEL.genericDialogCloseIconSelectors);
+    if (closeIcon) {
+      await humanClick(closeIcon);
+      return true;
+    }
+    return false;
+  }
+
+  /** 派发一组 hover 事件：BOSS 列表页的"打招呼"按钮是悬停后才渲染的 */
+  function fireHover(el) {
+    if (!el) return;
+    for (const type of ['mouseover', 'mouseenter', 'mousemove']) {
+      try {
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      } catch (e) {
+        // 某些环境下 MouseEvent 构造器受限，忽略即可
+      }
+    }
+  }
+
+  async function openChatForCard(card) {
+    // 1) 少数卡片样式默认就带按钮
+    let chatBtn = queryFirst(card, SEL.cardChatButton) || findByText(card, 'button, a, span', ['打招呼', '立即沟通']);
+
+    // 2) 绝大多数情况：先悬停，按钮才会出现
+    if (!chatBtn) {
+      try {
+        card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      } catch (e) {
+        // 忽略
+      }
+      await sleep(randomDelay(200, 400));
+      fireHover(card);
+      await sleep(450);
+      chatBtn = queryFirst(card, SEL.cardChatButton) || findByText(card, 'button, a, span, div', ['打招呼', '立即沟通']);
+    }
+
+    // 3) 有的实现把按钮挂到卡片外的浮层里：按纵向位置就近找，避免误点别的卡片
+    if (!chatBtn) {
+      try {
+        const cardRect = card.getBoundingClientRect();
+        const candidates = Array.from(document.querySelectorAll('button, a, span, div'))
+          .filter((el) => el.offsetParent !== null && /^(打招呼|立即沟通)$/.test((el.textContent || '').trim()));
+        chatBtn = candidates.find((el) => {
+          const r = el.getBoundingClientRect();
+          return r.height > 0 && r.top >= cardRect.top - 60 && r.bottom <= cardRect.bottom + 60;
+        }) || null;
+      } catch (e) {
+        chatBtn = null;
+      }
+    }
+
+    if (chatBtn) {
+      await humanClick(chatBtn);
+      return true;
+    }
+
+    // 4) 兜底：点卡片唤出详情面板。
+    //    这里有风险——如果卡片实际是链接，点击会整页跳转把脚本上下文销毁。
+    //    所以点完立刻复核卡片数量：列表消失/数量变化就判定为跳转，放弃该职位以保住任务。
+    const beforeCount = getJobCards().length;
+    fireHover(card);
+    await humanClick(card);
+    await sleep(700);
+
+    const afterCards = getJobCards();
+    if (afterCards.length === 0) {
+      log('点开卡片后职位列表消失（疑似整页跳转），放弃该职位以免任务丢失', 'warn');
+      return false;
+    }
+
+    chatBtn = findByText(document, 'button, a, span', ['打招呼', '立即沟通']);
+    if (!chatBtn) return false;
+
+    await humanClick(chatBtn);
+    return true;
+  }
+
+  function findAutoSentDialogButtons() {
+    const hasDialogText = SEL.autoSentDialogHints.some((hint) => document.body.textContent.includes(hint));
+    if (!hasDialogText) return null;
+    const stayBtn = findByText(document, 'button, span, a, div', SEL.autoSentDialogStayButtonTexts);
+    const continueBtn = findByText(document, 'button, span, a, div', SEL.autoSentDialogContinueButtonTexts);
+    if (!stayBtn && !continueBtn) return null;
+    return { stayBtn, continueBtn };
+  }
+
+  async function sendGreeting(greetingText) {
+    // 点击"打招呼"后，BOSS 可能出现两种情况，谁先出现处理谁：
+    // 1) 一个可编辑的聊天输入框 —— 我们填入自定义话术并发送；
+    // 2) 一个"已向BOSS发送消息"确认框 —— 说明 BOSS 已经用你在官方设置里配置的
+    //    默认招呼语直接发出去了，这里的自定义话术不会生效，只能确认并关闭继续下一个。
+    const outcome = await waitFor(() => {
+      const input = queryFirst(document, SEL.chatInput);
+      if (input) return { type: 'input', input };
+      const dialog = findAutoSentDialogButtons();
+      if (dialog) return { type: 'auto-sent', dialog };
+      return null;
+    }, { timeout: 6000 });
+
+    if (!outcome) {
+      return { ok: false, reason: '未找到聊天输入框，也没有检测到发送确认弹窗（可能页面结构已变化，或该职位需要先完善简历）' };
+    }
+
+    if (outcome.type === 'auto-sent') {
+      const btn = outcome.dialog.stayBtn || outcome.dialog.continueBtn;
+      await humanClick(btn);
+      return { ok: true, usedDefaultGreeting: true };
+    }
+
+    const input = outcome.input;
+    await humanClick(input);
+    await typeLikeHuman(input, greetingText);
+
+    const sendBtn = queryFirst(document, SEL.chatSendButton) || findByText(document, 'button, span, div', ['发送']);
+    if (sendBtn) {
+      await humanClick(sendBtn);
+    } else {
+      // 回退方案：模拟回车发送
+      await sleep(randomDelay(200, 500));
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+    }
+
+    return { ok: true };
+  }
+
+  // ---------- 翻页 ----------
+  /** 找到真正滚动职位列表的那个容器（可能是某个 overflow 的 div，而不是 window） */
+  function findScrollContainer() {
+    const cards = getJobCards();
+    let el = cards[0] ? cards[0].parentElement : null;
+    while (el && el !== document.documentElement) {
+      try {
+        const style = getComputedStyle(el);
+        if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 20) {
+          return el;
+        }
+      } catch (e) {
+        // 忽略
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  /**
+   * 滚动到底部触发"加载更多"，并确认列表真的变长了。
+   *
+   * 2026-11 实测：BOSS 的职位列表已经是**滚动加载**，页面上根本没有"下一页"元素。
+   * 原来只找按钮，于是每次都在第一屏就判定"已到最后一页"，只能吃到 15 个岗位。
+   *
+   * 这里做 3 次滚动重试：有的实现需要连续滚动/滚动后停顿才发请求。
+   */
+  async function tryScrollLoadMore() {
+    const before = currentListSignature();
+    const beforeCount = getJobCards().length;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const scroller = findScrollContainer();
+      try {
+        if (scroller) scroller.scrollTop = scroller.scrollHeight;
+        window.scrollTo(0, document.body.scrollHeight);
+      } catch (e) {
+        // 忽略
+      }
+
+      const changed = await waitFor(
+        () => currentListSignature() !== before || getJobCards().length > beforeCount,
+        { timeout: 4000, interval: 300 }
+      );
+      if (changed) {
+        await waitFor(() => getJobCards().length > 0, { timeout: 5000 });
+        await sleep(600);
+        return true;
+      }
+      // 没反应就再滚一次，给懒加载一点时间
+      await sleep(700);
+    }
+    return false;
+  }
+
+  /** 页面是否明确显示"没有更多了" */
+  function hasNoMoreHint() {
+    const hints = SEL.noMoreTextHints || ['没有更多', '已加载全部', '到底了'];
+    return hints.some((h) => document.body.innerText.includes(h));
+  }
+
+  /** 自检用：除了滚动探测，还把"加载更多/查看更多"这类按钮文案收集回来 */
+  async function probeMoreResults() {
+    const before = getJobCards().length;
+    const changed = await tryScrollLoadMore();
+    const after = getJobCards().length;
+    const texts = new Set();
+    Array.from(document.querySelectorAll('button, a, div, span')).forEach((el) => {
+      const t = (el.textContent || '').trim();
+      if (t && t.length <= 8 && /加载更多|查看更多|下一页|换一换|更多职位|没有更多/.test(t)) texts.add(t);
+    });
+    return {
+      scrollerFound: !!findScrollContainer(),
+      before,
+      after,
+      loadedMore: changed || after > before,
+      actionTexts: Array.from(texts).slice(0, 6)
+    };
+  }
+
+  async function findNextButton() {
+    const btn = queryFirst(document, SEL.nextPageButton);
+    if (btn) return btn;
+    return findByText(document, 'a, button, span, div', SEL.nextPageTextHints || ['下一页']);
+  }
+
+  /**
+   * 翻到下一页，并且**验证列表真的变了**。
+   * 返回 {moved:boolean, reachedEnd:boolean, reason?:string}
+   */
+  async function goToNextPage() {
+    const btn = await findNextButton();
+
+    if (!btn) {
+      // 没有"下一页"按钮时不要直接判"结束"：BOSS 现在是滚动加载
+      const loaded = await tryScrollLoadMore();
+      if (loaded) {
+        log('滚动到底部，加载了更多职位');
+        return { moved: true, reachedEnd: false, reason: '滚动加载了更多职位' };
+      }
+      return {
+        moved: false,
+        reachedEnd: true,
+        reason: hasNoMoreHint() ? '页面提示"没有更多"，列表已到底' : '滚动到底部也没有加载新职位'
+      };
+    }
+
+    const disabled =
+      btn.classList.contains('disabled') ||
+      btn.hasAttribute('disabled') ||
+      btn.getAttribute('aria-disabled') === 'true';
+    if (disabled) {
+      const loaded = await tryScrollLoadMore();
+      if (loaded) return { moved: true, reachedEnd: false, reason: '按钮已禁用，但滚动加载出了更多职位' };
+      return { moved: false, reachedEnd: true, reason: '"下一页"按钮已禁用（已到最后一页）' };
+    }
+
+    const before = currentListSignature();
+    const urlBefore = location.href;
+
+    // 关键：如果这次点击触发整页导航，本脚本会被销毁，
+    // 先把进度落盘，等新页面注入时自动续跑。
+    await persistRunState();
+
+    await humanClick(btn);
+
+    const changed = await waitFor(
+      () => currentListSignature() !== before || location.href !== urlBefore,
+      { timeout: 12000, interval: 300 }
+    );
+    if (!changed) {
+      await sleep(1200);
+      if (currentListSignature() !== before) {
+        await waitFor(() => getJobCards().length > 0, { timeout: 6000 });
+        return { moved: true, reachedEnd: false };
+      }
+      return { moved: false, reachedEnd: false, reason: '点击"下一页"后列表和地址都没有变化（可能选择器失效或页面未响应）' };
+    }
+
+    await waitFor(() => getJobCards().length > 0, { timeout: 8000 });
+    await sleep(600);
+    return { moved: true, reachedEnd: false };
+  }
+
+  // ---------- 主流程 ----------
+  function resetCounters() {
+    state.appliedCount = 0;
+    state.skippedCount = 0;
+    state.errorCount = 0;
+    state.scoredCount = 0;
+    state.aiFailCount = 0;
+    state.log = [];
+    state.jdCache = new Map();
+    state.salaryWarned = false;
+    state.jdBlockedCount = 0;
+  }
+
+  async function runAutomation(config, { resumeFrom = null } = {}) {
+    if (!SEL || !MATCH) {
+      log('脚本依赖未正确加载（selectors.js / matcher.js），请检查扩展是否完整安装', 'error');
+      state.running = false;
+      reportProgress();
+      return;
+    }
+
+    const resuming = !!resumeFrom;
+    state.running = true;
+    state.stopRequested = false;
+    state.config = config;
+
+    if (resuming) {
+      state.appliedCount = resumeFrom.appliedCount || 0;
+      state.skippedCount = resumeFrom.skippedCount || 0;
+      state.errorCount = resumeFrom.errorCount || 0;
+      state.scoredCount = resumeFrom.scoredCount || 0;
+      state.aiFailCount = resumeFrom.aiFailCount || 0;
+      state.startedAt = resumeFrom.startedAt || Date.now();
+      state.log = [];
+      log(`检测到页面刷新/跳转，自动继续上次任务（已投递 ${state.appliedCount} 个）`);
+    } else {
+      resetCounters();
+      state.startedAt = Date.now();
+      log('开始自动投递任务');
+    }
+
+    startKeepAlive();
+    try {
+      await runMainLoop(config, resuming);
+    } catch (e) {
+      state.errorCount += 1;
+      log(`任务异常终止：${e.message}`, 'error');
+    } finally {
+      state.running = false;
+      stopKeepAlive();
+      // 如果是"主动 reload 以刷新列表"，必须保留续跑状态，否则刚落盘就被自己清掉了
+      if (!state.preserveRunState) await clearRunState();
+      state.preserveRunState = false;
+      log(`任务结束，共投递 ${state.appliedCount} 个职位，跳过 ${state.skippedCount} 个，${state.errorCount} 个异常`);
+      reportProgress();
+    }
+  }
+
+  async function runMainLoop(config, resuming) {
+    const maxApplications = config.maxApplications || 20;
+    const aiEnabled = !!config.aiEnabled;
+
+    if (!resuming) {
+      if (config.keywords && config.keywords.length > 0) {
+        log(`自动搜索关键词「${config.keywords[0]}」...`);
+        await performSearch(config.keywords[0]);
+        if (state.stopRequested) return;
+      }
+
+      if (config.salaryMin || config.salaryMax) {
+        await applySalaryFilter(config.salaryMin, config.salaryMax);
+        if (state.stopRequested) return;
+      }
+
+      await selectDropdownFilterByText(SEL.jobTypeFilterTriggerTexts, config.jobType, '求职类型');
+      await selectDropdownFilterByText(SEL.experienceFilterTriggerTexts, config.experience, '工作经验');
+      await selectDropdownFilterByText(SEL.degreeFilterTriggerTexts, config.degree, '学历要求');
+      if (state.stopRequested) return;
+    } else {
+      log('续跑模式：跳过重复的搜索与筛选设置，直接接着处理当前列表');
+    }
+
+    const seen = await loadSeenIds();
+    let page = 1;
+    let round = 1;
+
+    while (state.running && !state.stopRequested && state.appliedCount < maxApplications) {
+      log(`===== 第 ${round} 轮 · 第 ${page} 页 =====`);
+
+      const cards = getJobCards();
+      if (cards.length === 0) {
+        const found = await waitFor(() => getJobCards().length > 0, { timeout: 6000 });
+        if (!found) {
+          log('当前页面未找到职位卡片，任务结束', 'warn');
+          return;
+        }
+      }
+
+      const freshCards = getJobCards();
+      log(`本页发现 ${freshCards.length} 个职位卡片`);
+
+      for (const card of freshCards) {
+        if (state.stopRequested || state.appliedCount >= maxApplications) break;
+
+        await dismissGenericDialog();
+
+        let info;
+        try {
+          info = extractJobInfo(card);
+        } catch (e) {
+          state.errorCount += 1;
+          log(`解析职位卡片失败：${e.message}`, 'error');
+          continue;
+        }
+
+        if (!info.title) continue;
+        if (seen.has(info.jobId)) continue;
+
+        if (isCardAlreadyChatted(card)) {
+          seen.add(info.jobId);
+          await markSeen(info.jobId);
+          continue;
+        }
+
+        // 第一道：本地规则（排除词/公司黑名单/薪资/关键词）。
+        // 放在 AI 之前是为了省 token——明显不合适的根本不用花钱问模型。
+        const { matched, reason } = MATCH(info, config);
+        if (!matched) {
+          state.skippedCount += 1;
+          seen.add(info.jobId);
+          await markSeen(info.jobId);
+          log(`跳过《${info.title}》@${info.company}：${reason}`);
+          continue;
+        }
+
+        // 第二道：薪资兜底 + 大模型打分
+        // 注意：即使用户没开 AI，只要设了薪资范围且列表页薪资被字体混淆（没有数字），
+        // 也要去详情页捞一次薪资，否则「薪资过滤」会静默失效。
+        const needSalaryFallback = !!((config.salaryMin || config.salaryMax) && info.salary && !/\d/.test(info.salary));
+        const needDetail = aiEnabled || needSalaryFallback;
+
+        if (needDetail) {
+          const detail = await fetchJdInfo(info);
+
+          let effectiveSalary = info.salary;
+          if (effectiveSalary && !/\d/.test(effectiveSalary) && detail.salaryHint) {
+            effectiveSalary = detail.salaryHint;
+            info.salary = detail.salaryHint;
+          }
+
+          if (config.salaryMin || config.salaryMax) {
+            const salaryRange = PARSE_SALARY ? PARSE_SALARY(effectiveSalary) : null;
+            if (!salaryRange && !state.salaryWarned) {
+              state.salaryWarned = true;
+              log('列表页与详情页都没取到可解析的薪资（BOSS 对数字做了字体混淆），本轮不按薪资过滤', 'warn');
+            }
+            if (salaryRange) {
+              const lo = config.salaryMin || 0;
+              const hi = config.salaryMax || Infinity;
+              if (!(salaryRange.max >= lo && salaryRange.min <= hi)) {
+                state.skippedCount += 1;
+                seen.add(info.jobId);
+                await markSeen(info.jobId);
+                log(`跳过《${info.title}》@${info.company}：薪资 ${effectiveSalary} 不在期望范围内`);
+                continue;
+              }
+            }
+          }
+
+          if (!aiEnabled) {
+            // 没开 AI：只要拿到 JD 就把它挂上去，让关键词/排除词能命中职位描述里的技能词
+            info.jdText = detail.jd;
+          } else {
+            const scored = await scoreViaAi(info, detail.jd);
+
+            if (!scored.ok) {
+              state.aiFailCount += 1;
+              state.errorCount += 1;
+              // 打分失败不拉黑，下次运行会重试（也避免因为一次网络抖动永久漏掉岗位）
+              log(`《${info.title}》@${info.company}：AI 打分失败（${scored.error}），本次跳过、下次重试`, 'error');
+              continue;
+            }
+
+            state.scoredCount += 1;
+            const decision = SHOULD_APPLY ? SHOULD_APPLY(scored.result, config.aiThreshold) : { ok: true, why: '' };
+            const tag = scored.cached ? '（缓存）' : '';
+            if (!decision.ok) {
+              state.skippedCount += 1;
+              seen.add(info.jobId);
+              await markSeen(info.jobId);
+              log(`跳过《${info.title}》@${info.company}：${decision.why}${tag}`);
+              continue;
+            }
+            log(`《${info.title}》@${info.company}：${decision.why}${tag}，准备投递`, 'success');
+          }
+        }
+
+        try {
+          const opened = await openChatForCard(card);
+          if (!opened) {
+            state.errorCount += 1;
+            log(`《${info.title}》@${info.company}：未找到打招呼按钮，跳过（下次会重试）`, 'warn');
+            continue;
+          }
+
+          const result = await sendGreeting(config.greeting);
+          if (result.ok) {
+            state.appliedCount += 1;
+            const note = result.usedDefaultGreeting
+              ? '（该职位使用了 BOSS 自带的默认招呼语，未能填入自定义话术，可在 BOSS「消息通知-设置招呼语」里修改默认文案）'
+              : '';
+            log(`已投递《${info.title}》@${info.company}（${info.salary}）${note}`, 'success');
+            seen.add(info.jobId);
+            await markSeen(info.jobId);
+            await persistRunState();
+          } else {
+            state.errorCount += 1;
+            log(`《${info.title}》@${info.company}：${result.reason}（下次会重试）`, 'error');
+          }
+        } catch (e) {
+          state.errorCount += 1;
+          log(`处理《${info.title}》@${info.company} 时出错：${e.message}（下次会重试）`, 'error');
+        }
+
+        if (state.appliedCount >= maxApplications) break;
+
+        const delay = randomDelay(config.minDelayMs, config.maxDelayMs);
+        await interruptibleSleep(delay);
+      }
+
+      if (state.stopRequested || state.appliedCount >= maxApplications) return;
+
+      const nav = await goToNextPage();
+      if (nav.moved) {
+        page += 1;
+        await sleep(1200);
+        continue;
+      }
+
+      // 翻不动了：要么真的到最后一页，要么选择器失效
+      log(nav.reachedEnd ? `翻页结束：${nav.reason}` : `翻页失败：${nav.reason}`, nav.reachedEnd ? 'info' : 'warn');
+
+      // 「定时刷新捞新岗位」：一轮翻完后等待 N 分钟，重新搜索，靠历史记录只投新的
+      if (config.refreshEnabled && config.refreshIntervalMin > 0) {
+        if (state.appliedCount >= maxApplications) return;
+        log(`等待 ${config.refreshIntervalMin} 分钟后重新搜索新岗位（点"停止"可立即结束）...`);
+        await interruptibleSleep(config.refreshIntervalMin * 60 * 1000);
+        if (state.stopRequested) return;
+
+        round += 1;
+        page = 1;
+        log(`第 ${round} 轮：重新搜索「${(config.keywords && config.keywords[0]) || '当前列表'}」以获取新发布的岗位...`);
+        if (config.keywords && config.keywords.length > 0) {
+          await performSearch(config.keywords[0]);
+        } else {
+          // 没有关键词时只能靠刷新页面重新拉列表；先落盘，reload 后由注入逻辑续跑
+          state.preserveRunState = true;
+          await persistRunState();
+          location.reload();
+          return;
+        }
+        await sleep(1000);
+        continue;
+      }
+
+      return;
+    }
+  }
+
+  // ---------- 自检（把当前页面真实的选择器命中情况回报给弹窗） ----------
+  /**
+   * 按"第一组能命中的选择器"探测，返回 {selector, count}。
+   *
+   * 注意：早期版本这里返回的是 {选择器: 数量} 的映射对象，弹窗里被渲染成
+   * "[object Object]"，等于自检结果全废。现在只回报真正生效的那一条选择器 + 数量。
+   */
+  function probeGroup(selectors) {
+    for (const sel of selectors || []) {
+      try {
+        const n = document.querySelectorAll(sel).length;
+        if (n > 0) return { selector: sel, count: n };
+      } catch (e) {
+        // 选择器语法错误，跳过
+      }
+    }
+    return { selector: null, count: 0 };
+  }
+
+  /** 把首张卡片的结构压成可读摘要，便于在页面改版时定位新选择器 */
+  function describeCard(card) {
+    if (!card) return null;
+    const parts = [];
+    const nodes = Array.from(card.querySelectorAll('*')).slice(0, 80);
+    for (const el of nodes) {
+      const cls = Array.from(el.classList || []).join('.');
+      if (!cls) continue;
+      const txt = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 24);
+      parts.push(`${el.tagName.toLowerCase()}.${cls}${txt ? ` 「${txt}」` : ''}`);
+    }
+    return {
+      cardClass: Array.from(card.classList || []).join('.'),
+      children: parts.slice(0, 18),
+      htmlSnippet: (card.outerHTML || '').slice(0, 1200)
+    };
+  }
+
+  /** 收集页面上"像分页"的元素，判断到底有没有下一页 */
+  function describePagination() {
+    const candidates = [];
+    const all = Array.from(document.querySelectorAll('[class*="page"], [class*="pagination"], [class*="options"]'));
+    for (const el of all) {
+      const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
+      if (!txt || txt.length > 120) continue;
+      const cls = Array.from(el.classList || []).join('.');
+      if (!cls) continue;
+      candidates.push({ cls, text: txt.slice(0, 60) });
+      if (candidates.length >= 5) break;
+    }
+    return {
+      hasNextPageText: document.body.innerText.includes('下一页'),
+      candidates,
+      footerSnippet: ''
+    };
+  }
+
+  async function buildSelfCheckReport() {
+    const cards = getJobCards();
+    const first = cards[0] ? extractJobInfo(cards[0]) : null;
+    let jdLen = 0;
+    let jdBlocked = false;
+    let jdSample = '';
+    let salaryHint = '';
+    if (first && first.href) {
+      const detail = await fetchJdInfo(first);
+      jdLen = detail.jd.length;
+      // 只有确实被登录/验证页拦下才算 blocked；"拿不到正文"不等于被拦
+      jdBlocked = !!detail.blocked;
+      jdSample = detail.jd.slice(0, 160);
+      salaryHint = detail.salaryHint || '';
+    }
+
+    const nextBtn = await findNextButton();
+    // 先记录分页痕迹，再滚动探测（滚动会改变页面，探测必须在后面）
+    const pagination = describePagination();
+    const more = await probeMoreResults();
+
+    return {
+      url: location.href,
+      isJobPage: /\/web\/geek\/job/.test(location.pathname),
+      cardCount: cards.length,
+      listSignatureLength: currentListSignature().length,
+      selectors: {
+        jobCard: probeGroup(SEL.jobCard),
+        jobTitle: probeGroup(SEL.jobTitle),
+        companyName: probeGroup(SEL.companyName),
+        jobSalary: probeGroup(SEL.jobSalary),
+        jobTags: probeGroup(SEL.jobTags),
+        cardChatButton: probeGroup(SEL.cardChatButton),
+        nextPageButton: probeGroup(SEL.nextPageButton),
+        searchInput: probeGroup(SEL.searchInput)
+      },
+      firstCard: first ? {
+        title: first.title,
+        company: first.company,
+        salary: first.salary,
+        jobId: first.jobId,
+        hasHref: !!first.href,
+        // BOSS 对薪资数字做了字体混淆：textContent 里可能只有 "-K·薪"，没有数字。
+        // 这不是选择器坏了，而是抓不到可解析的数字，薪资过滤因此无法生效。
+        salaryHasDigits: /\d/.test(first.salary || ''),
+        companyIsAnonymous: !!(cards[0] && cards[0].querySelector('.is-anonymous'))
+      } : null,
+      cardShape: describeCard(cards[0]),
+      pagination,
+      moreResults: more,
+      nextButtonText: nextBtn ? (nextBtn.textContent || '').trim().slice(0, 20) : null,
+      jd: { length: jdLen, fetched: jdLen > 0, blockedOrFailed: jdBlocked, sample: jdSample, salaryHint },
+      ts: Date.now()
+    };
+  }
+
+  // ---------- 消息入口 ----------
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message.type === 'BA_START') {
+      if (state.running) {
+        sendResponse({ ok: false, reason: '任务已在运行中' });
+        return true;
+      }
+      runAutomation(message.config);
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message.type === 'BA_STOP') {
+      state.stopRequested = true;
+      state.running = false;
+      stopKeepAlive();
+      clearRunState();
+      log('收到停止指令，正在结束当前任务...', 'warn');
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message.type === 'BA_GET_STATE') {
+      sendResponse(snapshotState());
+      return true;
+    }
+
+    if (message.type === 'BA_SELF_CHECK') {
+      buildSelfCheckReport()
+        .then(sendResponse)
+        .catch((e) => sendResponse({ error: e.message }));
+      return true; // 异步
+    }
+
+    return false;
+  });
+
+  // ---------- 页面加载时尝试续跑 ----------
+  (async function tryResume() {
+    if (!/\/web\/geek\/job/.test(location.pathname)) return;
+    const st = await readRunState();
+    if (!st || st.stopRequested) return;
+    if (Date.now() - (st.updatedAt || 0) > RUN_STATE_TTL_MS) {
+      await clearRunState();
+      return;
+    }
+    if (!st.config) return;
+    // 等页面把职位列表渲染出来再接手
+    const ready = await waitFor(() => getJobCards().length > 0, { timeout: 12000 });
+    if (!ready || state.running) return;
+    log('页面已重新加载，自动续跑上次未完成的任务');
+    runAutomation(st.config, { resumeFrom: st });
+  })();
+})();

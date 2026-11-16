@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>BOSS直聘自动投递助手</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <h1>BOSS直聘自动投递助手</h1>
+    <p class="subtitle">登录 BOSS 直聘后，在职位搜索页打开本插件</p>
+  </header>
+
+  <main>
+    <section id="not-on-page-hint" class="hint hidden">
+      ⚠️ 请先在浏览器中打开
+      <a href="https://www.zhipin.com/web/geek/job" target="_blank" rel="noopener">BOSS直聘职位搜索页</a>
+      并登录，再点击"开始投递"。
+    </section>
+
+    <form id="config-form">
+      <label>
+        岗位关键词（用逗号分隔；第一个关键词会自动填入 BOSS 搜索框并触发搜索，
+        全部关键词都会用于结果筛选，命中任意一个即匹配，留空表示不限制并直接使用当前页面的职位列表）
+        <input type="text" id="keywords" placeholder="例如：前端工程师, React, Vue" />
+      </label>
+
+      <label>
+        排除关键词（命中任意一个则跳过）
+        <input type="text" id="excludeKeywords" placeholder="例如：外包, 销售" />
+      </label>
+
+      <label>
+        排除公司（命中任意一个则跳过）
+        <input type="text" id="excludeCompanies" placeholder="例如：某某外包公司" />
+      </label>
+
+      <div class="row">
+        <label>
+          期望薪资下限 (K)
+          <input type="number" id="salaryMin" min="0" placeholder="例如 15" />
+        </label>
+        <label>
+          期望薪资上限 (K)
+          <input type="number" id="salaryMax" min="0" placeholder="例如 30" />
+        </label>
+      </div>
+
+      <p class="section-title">以下三项会在任务开始时自动应用到 BOSS 搜索页的原生筛选器上（选"不限"则不调整）：</p>
+
+      <div class="row">
+        <label>
+          求职类型
+          <select id="jobType">
+            <option value="">不限</option>
+            <option value="全职">全职</option>
+            <option value="兼职">兼职</option>
+            <option value="实习">实习</option>
+          </select>
+        </label>
+        <label>
+          工作经验
+          <select id="experience">
+            <option value="">不限</option>
+            <option value="应届生">应届生</option>
+            <option value="1年以内">1年以内</option>
+            <option value="1-3年">1-3年</option>
+            <option value="3-5年">3-5年</option>
+            <option value="5-10年">5-10年</option>
+            <option value="10年以上">10年以上</option>
+          </select>
+        </label>
+      </div>
+
+      <label>
+        学历要求
+        <select id="degree">
+          <option value="">不限</option>
+          <option value="初中及以下">初中及以下</option>
+          <option value="中专/中技">中专/中技</option>
+          <option value="高中">高中</option>
+          <option value="大专">大专</option>
+          <option value="本科">本科</option>
+          <option value="硕士">硕士</option>
+          <option value="博士">博士</option>
+        </select>
+      </label>
+
+      <details id="ai-section" class="panel">
+        <summary>AI 智能匹配（大模型逐条打分）</summary>
+
+        <label class="checkline">
+          <input type="checkbox" id="aiEnabled" />
+          <span>启用 AI 打分：先按本地规则粗筛，再交给大模型判断值不值得投</span>
+        </label>
+
+        <label>
+          接口地址（兼容 OpenAI Chat Completions 的地址，可只填到域名）
+          <input type="text" id="apiEndpoint" placeholder="https://api.deepseek.com" />
+        </label>
+
+        <div class="row">
+          <label>
+            模型名
+            <input type="text" id="apiModel" placeholder="deepseek-flash" />
+          </label>
+          <label>
+            阈值（分数 ≥ 此值才投）
+            <input type="number" id="aiThreshold" min="0" max="100" value="70" />
+          </label>
+        </div>
+
+        <label>
+          API Key
+          <input type="password" id="apiKey" placeholder="sk-..." autocomplete="off" />
+        </label>
+
+        <label>
+          我的求职画像（随便写：YAML / JSON / 大白话都行，原样发给模型）
+          <textarea id="profile" rows="6" placeholder="例如：5 年前端，主栈 React/TypeScript，做过中后台与数据可视化，期望 25-35K，不考虑外包与驻场"></textarea>
+        </label>
+
+        <label>
+          自定义判断标准（可选：整段替换默认口径，画像字段怎么解读由你决定）
+          <textarea id="aiPrompt" rows="6" placeholder="留空则用默认：&#10;你是一名严谨的求职顾问，任务是判断某个招聘岗位是否值得求职者投递简历。&#10;请依据下方给出的求职者画像与岗位信息作判断。&#10;&#10;例如你可以写：&#10;- anti_match 命中任意一条 → score ≤ 25&#10;- JD 要求年限高于我的实际年限 → 显著降分"></textarea>
+        </label>
+
+        <p class="notice">
+          下面这段「输出格式」是固定的、不可修改 —— 插件靠它解析分数：
+          <code>{"score":0-100,"reason":"...","risks":["..."]}</code>
+        </p>
+
+        <p class="notice">
+          画像与 API Key 仅保存在本机浏览器存储中，只会发给上面这个接口地址。
+          每条职位产生一次请求，结果按岗位缓存，不会重复计费。
+        </p>
+
+        <div class="cache-actions">
+          <button type="button" id="clear-cache-btn" class="ghost small">清空打分缓存</button>
+          <button type="button" id="clear-seen-btn" class="ghost small">清空已处理记录</button>
+        </div>
+        <p class="notice">
+          改了画像或阈值后，如果想重新评估"之前被 AI 拒掉"的岗位，需要先清空已处理记录
+          （否则同一岗位不会再看第二遍）。
+        </p>
+      </details>
+
+      <details id="refresh-section" class="panel">
+        <summary>新岗位刷新（翻完一轮后重新搜索）</summary>
+        <label class="checkline">
+          <input type="checkbox" id="refreshEnabled" />
+          <span>启用：一轮翻完后等待指定时间再重新搜索，只投历史记录里没有的新岗位</span>
+        </label>
+        <label>
+          间隔（分钟）
+          <input type="number" id="refreshIntervalMin" min="1" max="240" value="10" />
+        </label>
+      </details>
+
+      <label>
+        打招呼话术
+        <textarea id="greeting" rows="4" placeholder="您好，我对这个岗位很感兴趣..."></textarea>
+      </label>
+
+      <div class="row">
+        <label>
+          单次最多投递数
+          <input type="number" id="maxApplications" min="1" max="200" value="20" />
+        </label>
+        <label>
+          单个操作间隔 (秒)
+          <span class="delay-inputs">
+            <input type="number" id="minDelay" min="1" value="3" /> ~
+            <input type="number" id="maxDelay" min="1" value="8" />
+          </span>
+        </label>
+      </div>
+
+      <p class="notice">
+        建议保持较长的操作间隔，模拟真实手速，避免触发平台风控导致账号异常。
+        本插件不会读取或上传你的账号、Cookie 等任何信息，全部操作均在你本地浏览器内完成。
+      </p>
+
+      <div class="actions">
+        <button type="button" id="start-btn" class="primary">开始投递</button>
+        <button type="button" id="stop-btn" class="danger" disabled>停止</button>
+        <button type="button" id="selfcheck-btn" class="ghost">自检</button>
+      </div>
+
+      <pre id="selfcheck-out" class="selfcheck hidden"></pre>
+    </form>
+
+    <section class="status">
+      <div class="status-line">
+        <span id="status-badge" class="badge idle">未运行</span>
+        <span>已投递 <strong id="applied-count">0</strong></span>
+        <span>已跳过 <strong id="skipped-count">0</strong></span>
+        <span>异常 <strong id="error-count">0</strong></span>
+      </div>
+      <div id="log-panel" class="log-panel"></div>
+    </section>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>
