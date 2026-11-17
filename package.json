@@ -1,6 +1,6 @@
 {
   "name": "boss-auto-apply-assistant",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "BOSS直聘自动投递浏览器扩展：滚动加载、抓取职位详情、AI 打分筛选后自动打招呼",
   "license": "MIT",

@@ -933,10 +933,19 @@
       const freshCards = getJobCards();
       log(`本页发现 ${freshCards.length} 个职位卡片`);
 
+      // 本轮统计：不加这个，"为什么 75 个卡片只处理了几个"永远说不清。
+      // （每轮都会重新遍历全部卡片，但历史记录里有的会被静默跳过，所以日志稀疏是正常的）
+      const stat = { total: freshCards.length, noTitle: 0, seen: 0, chatted: 0, ruleSkip: 0, evaluated: 0, applied: 0 };
+      let lastDialogCheck = 0;
+
       for (const card of freshCards) {
         if (state.stopRequested || state.appliedCount >= maxApplications) break;
 
-        await dismissGenericDialog();
+        // 弹窗检测很贵（要遍历整页元素），按时间节流，别每张卡片都跑一遍
+        if (Date.now() - lastDialogCheck > 2500) {
+          lastDialogCheck = Date.now();
+          await dismissGenericDialog();
+        }
 
         let info;
         try {
@@ -947,10 +956,17 @@
           continue;
         }
 
-        if (!info.title) continue;
-        if (seen.has(info.jobId)) continue;
+        if (!info.title) {
+          stat.noTitle += 1;
+          continue;
+        }
+        if (seen.has(info.jobId)) {
+          stat.seen += 1;
+          continue;
+        }
 
         if (isCardAlreadyChatted(card)) {
+          stat.chatted += 1;
           seen.add(info.jobId);
           await markSeen(info.jobId);
           continue;
@@ -961,6 +977,7 @@
         const { matched, reason } = MATCH(info, config);
         if (!matched) {
           state.skippedCount += 1;
+          stat.ruleSkip += 1;
           seen.add(info.jobId);
           await markSeen(info.jobId);
           log(`跳过《${info.title}》@${info.company}：${reason}`);
@@ -1005,6 +1022,7 @@
             // 没开 AI：只要拿到 JD 就把它挂上去，让关键词/排除词能命中职位描述里的技能词
             info.jdText = detail.jd;
           } else {
+            stat.evaluated += 1;
             const scored = await scoreViaAi(info, detail.jd);
 
             if (!scored.ok) {
@@ -1040,6 +1058,7 @@
           const result = await sendGreeting(config.greeting);
           if (result.ok) {
             state.appliedCount += 1;
+            stat.applied += 1;
             const note = result.usedDefaultGreeting
               ? '（该职位使用了 BOSS 自带的默认招呼语，未能填入自定义话术，可在 BOSS「消息通知-设置招呼语」里修改默认文案）'
               : '';
@@ -1060,6 +1079,16 @@
 
         const delay = randomDelay(config.minDelayMs, config.maxDelayMs);
         await interruptibleSleep(delay);
+      }
+
+      // 每轮结束打一条可解释的小结：这是判断"有没有漏处理岗位"的唯一依据
+      log(
+        `本轮小结：卡片 ${stat.total} 条 → 历史已处理 ${stat.seen}｜已招呼过 ${stat.chatted}｜无标题 ${stat.noTitle}` +
+        `｜规则/薪资跳过 ${stat.ruleSkip}｜送 AI 评估 ${stat.evaluated}｜本轮投递 ${stat.applied}`
+      );
+      if (stat.seen + stat.chatted > 0) {
+        const n = stat.seen + stat.chatted;
+        log(`（其中 ${n} 条来自历史记录，不会重复评估；想重新评估请点弹窗「清空已处理记录」）`);
       }
 
       if (state.stopRequested || state.appliedCount >= maxApplications) return;
