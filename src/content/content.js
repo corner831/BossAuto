@@ -44,10 +44,54 @@
     jdCache: new Map(),
     salaryWarned: false,
     jdBlockedCount: 0,
-    lastGreetingAt: 0
+    lastGreetingAt: 0,
+    lastAction: ''
   };
 
   // ---------- 基础工具 ----------
+  /** 记录"当前正在做什么"，页面被卸载时写盘，便于下次判断是谁触发了跳转/刷新 */
+  function setAction(label) {
+    state.lastAction = label;
+  }
+
+  // 阻止"点击职位链接导致整页跳转"——那会让内容脚本被销毁，任务看起来像"页面自己刷新了"。
+  // 只在任务运行期间生效，且只拦 job_detail 链接的默认导航；
+  // BOSS 自己的 SPA 处理（history.pushState）不受影响。
+  document.addEventListener('click', (event) => {
+    if (!state.running) return;
+    try {
+      const anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+      if (!anchor) return;
+      const href = anchor.getAttribute('href') || '';
+      if (!/\/job_detail\//.test(href)) return;
+      // 如果点击目标本身就是要打开聊天/沟通按钮，不要拦
+      const text = (anchor.textContent || '').trim();
+      if (/打招呼|立即沟通|继续沟通/.test(text)) return;
+      event.preventDefault();
+      // eslint-disable-next-line no-console
+      console.log('[BOSS自动投递] 已阻止职位详情链接的整页跳转：', href);
+    } catch (e) {
+      // 忽略
+    }
+  }, true);
+
+  // 页面被卸载/跳转时留个记录，下次注入时能说清"上一次为什么没了"
+  window.addEventListener('pagehide', () => {
+    try {
+      chrome.storage.local.set({
+        ba_last_unload: {
+          at: Date.now(),
+          running: !!state.running,
+          lastAction: state.lastAction || '',
+          href: location.href,
+          applied: state.appliedCount || 0
+        }
+      }).catch(() => {});
+    } catch (e) {
+      // 忽略
+    }
+  });
+
   function log(message, level = 'info') {
     const entry = { time: new Date().toLocaleTimeString('zh-CN', { hour12: false }), message, level };
     state.log.push(entry);
@@ -794,6 +838,7 @@
 
   async function sendGreeting(greetingText) {
     state.lastGreetingAt = Date.now();
+    setAction('发送招呼语');
     // 点击"打招呼"后，BOSS 可能出现两种情况，谁先出现处理谁：
     // 1) 一个可编辑的聊天输入框 —— 我们填入自定义话术并发送；
     // 2) 一个"已向BOSS发送消息"确认框 —— 说明 BOSS 已经用你在官方设置里配置的
@@ -1075,6 +1120,7 @@
 
     if (!resuming) {
       if (config.keywords && config.keywords.length > 0) {
+        setAction('自动搜索关键词');
         log(`自动搜索关键词「${config.keywords[0]}」...`);
         await performSearch(config.keywords[0]);
         if (state.stopRequested) return;
@@ -1229,6 +1275,7 @@
         try {
           // 点击「打招呼」之前先清掉上一个岗位可能遗留的确认框：
           // 它既会遮挡点击，也会污染本次的"是否发送成功"判定。
+          setAction(`点击打招呼：《${info.title}》`);
           await clearStaleSentDialog();
           const opened = await openChatForCard(card);
           if (!opened) {
@@ -1237,8 +1284,7 @@
             continue;
           }
 
-          const result = await sendGreeting(config.greeting);
-          if (result.ok) {
+          const result = await sendGreeting(config.greeting);          if (result.ok) {
             state.appliedCount += 1;
             stat.applied += 1;
             const notes = [];
@@ -1281,6 +1327,7 @@
 
       if (state.stopRequested || state.appliedCount >= maxApplications) return;
 
+      setAction('滚动加载/翻页');
       const nav = await goToNextPage();
       if (nav.moved) {
         page += 1;
@@ -1470,6 +1517,24 @@
   // ---------- 页面加载时尝试续跑 ----------
   (async function tryResume() {
     if (!/\/web\/geek\/job/.test(location.pathname)) return;
+
+    // 先看上次页面是怎么没的——这能解释"为什么任务跑到一半页面自己刷新了"
+    try {
+      const u = await chrome.storage.local.get('ba_last_unload');
+      const rec = u.ba_last_unload;
+      if (rec && rec.running && Date.now() - rec.at < 120000) {
+        const ago = Math.round((Date.now() - rec.at) / 1000);
+        const where = rec.lastAction ? `「${rec.lastAction}」` : '未知步骤';
+        if (rec.href && rec.href !== location.href) {
+          log(`上次任务在${where}时页面发生了跳转（${ago} 秒前，已投递 ${rec.applied} 个），当前地址与跳转前不同`, 'warn');
+        } else {
+          log(`上次任务在${where}时页面被重新加载（${ago} 秒前，已投递 ${rec.applied} 个）`, 'warn');
+        }
+      }
+    } catch (e) {
+      // 忽略
+    }
+
     const st = await readRunState();
     if (!st || st.stopRequested) return;
     if (Date.now() - (st.updatedAt || 0) > RUN_STATE_TTL_MS) {
