@@ -126,13 +126,20 @@
     const jobId = location.pathname;
     const title = guessTitle();
     const back = unload.href || run.searchUrl || '';
+    const onDetailPage = /^\/job_detail\//.test(location.pathname);
 
     // 本轮任务内的跳转计数（任务结束即失效，不做永久黑名单）
     const counts = run.bounceCounts && typeof run.bounceCounts === 'object' ? { ...run.bounceCounts } : {};
     if (jobId) counts[jobId] = (counts[jobId] || 0) + 1;
 
-    // 在详情页就地补投
-    const result = await tryDeliver(run.config.greeting);
+    let result;
+    if (onDetailPage) {
+      // 落在职位详情页：就地补投
+      result = await tryDeliver(run.config.greeting);
+    } else {
+      // 落在沟通页这类页面：没法补投，只回跳（不是当前岗位的问题，也不要误记成功）
+      result = { ok: false, reason: `跳转到了非详情页（${location.pathname}），未发送新消息` };
+    }
 
     await chrome.storage.local
       .set({

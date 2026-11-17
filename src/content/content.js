@@ -677,9 +677,20 @@
     }
   }
 
+  /**
+   * 打开某个岗位的打招呼入口。
+   *
+   * 返回 { ok, already, reason }：
+   * - already=true 表示按钮文案是「继续沟通/已发送/继续聊」——该岗位此前已联系过，
+   *   **绝不能再点**：点了会跳到沟通页，任务直接被带走。
+   * - ok=false 表示没找到可用入口。
+   */
   async function openChatForCard(card, info) {
+    const alreadyHints = SEL.alreadyChattedTextHints || ['继续沟通', '已发送', '继续聊'];
+    const isAlreadyText = (t) => alreadyHints.includes((t || '').trim());
+
     // 1) 少数卡片样式默认就带按钮
-    let chatBtn = queryFirst(card, SEL.cardChatButton) || findByText(card, 'button, a, span', ['打招呼', '立即沟通']);
+    let chatBtn = queryFirst(card, SEL.cardChatButton) || findByText(card, 'button, a, span', ['打招呼', '立即沟通', '继续沟通']);
 
     // 2) 绝大多数情况：先悬停，按钮才会出现
     if (!chatBtn) {
@@ -691,7 +702,7 @@
       await sleep(randomDelay(200, 400));
       fireHover(card);
       await sleep(450);
-      chatBtn = queryFirst(card, SEL.cardChatButton) || findByText(card, 'button, a, span, div', ['打招呼', '立即沟通']);
+      chatBtn = queryFirst(card, SEL.cardChatButton) || findByText(card, 'button, a, span, div', ['打招呼', '立即沟通', '继续沟通']);
     }
 
     // 3) 有的实现把按钮挂到卡片外的浮层里：按纵向位置就近找，避免误点别的卡片
@@ -699,7 +710,7 @@
       try {
         const cardRect = card.getBoundingClientRect();
         const candidates = Array.from(document.querySelectorAll('button, a, span, div'))
-          .filter((el) => el.offsetParent !== null && /^(打招呼|立即沟通)$/.test((el.textContent || '').trim()));
+          .filter((el) => el.offsetParent !== null && /^(打招呼|立即沟通|继续沟通|已发送|继续聊)$/.test((el.textContent || '').trim()));
         chatBtn = candidates.find((el) => {
           const r = el.getBoundingClientRect();
           return r.height > 0 && r.top >= cardRect.top - 60 && r.bottom <= cardRect.bottom + 60;
@@ -710,18 +721,20 @@
     }
 
     if (chatBtn) {
+      const text = (chatBtn.textContent || '').trim();
+      if (isAlreadyText(text)) {
+        return { ok: false, already: true, reason: text };
+      }
       setAction(`点击打招呼按钮：《${(info && info.title) || ''}》`);
       await humanClick(chatBtn);
-      return true;
+      return { ok: true, already: false };
     }
 
     // 4) 兜底：点卡片唤出详情面板。
     //    风险：BOSS 有时会在卡片上挂 JS 点击处理器并直接整页跳转，
     //    这种情况 <a> 的 preventDefault 拦不住，脚本会被销毁。
-    //    这里先用"卡片里是否有 job_detail 链接"预判，把动作标签写清楚，
-    //    真跳走了 detail-guard.js 会把页面弹回来并把这个岗位加入跳过名单。
+    //    真跳走了 detail-guard.js 会在落地的详情页补投并弹回。
     const hasDetailLink = !!card.querySelector('a[href*="/job_detail/"]');
-    const beforeCount = getJobCards().length;
     setAction(`点击职位卡片：《${(info && info.title) || ''}》${hasDetailLink ? '（含详情链接，可能跳转）' : ''}`);
     fireHover(card);
     await humanClick(card);
@@ -729,16 +742,20 @@
 
     const afterCards = getJobCards();
     if (afterCards.length === 0) {
-      log('点开卡片后职位列表消失（疑似整页跳转），放弃该职位以免任务丢失', 'warn');
-      return false;
+      return { ok: false, already: false, reason: '点开卡片后职位列表消失（疑似整页跳转）' };
     }
 
-    chatBtn = findByText(document, 'button, a, span', ['打招呼', '立即沟通']);
-    if (!chatBtn) return false;
+    chatBtn = findByText(document, 'button, a, span', ['打招呼', '立即沟通', '继续沟通']);
+    if (!chatBtn) return { ok: false, already: false, reason: '未找到打招呼按钮' };
+
+    const text2 = (chatBtn.textContent || '').trim();
+    if (isAlreadyText(text2)) {
+      return { ok: false, already: true, reason: text2 };
+    }
 
     setAction(`点击详情面板里的打招呼：《${(info && info.title) || ''}》`);
     await humanClick(chatBtn);
-    return true;
+    return { ok: true, already: false };
   }
 
   /** 元素是否真的可见（有占位、未被隐藏） */
@@ -855,6 +872,17 @@
    * 另外加了时间保护：刚投递完 6 秒内出现的弹窗，很可能就是刚才那次产生的，
    * 不去动它，避免"把正常投递的弹窗当遗留关掉"。
    */
+  /** 发送一次 Escape：模态框的通用关闭方式，比乱点按钮安全 */
+  function pressEscape() {
+    try {
+      for (const type of ['keydown', 'keyup']) {
+        document.dispatchEvent(new KeyboardEvent(type, { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+      }
+    } catch (e) {
+      // 忽略
+    }
+  }
+
   async function clearStaleSentDialog() {
     if (Date.now() - (state.lastGreetingAt || 0) < 6000) {
       const justNow = findAutoSentDialogButtons();
@@ -863,9 +891,27 @@
     const stale = findAutoSentDialogButtons();
     if (!stale) return false;
     log(`检测到疑似遗留的确认框（${describeDialog(stale)}），先关闭它再继续`, 'warn');
+
     await humanClick(stale.stayBtn || stale.continueBtn);
-    const gone = await waitConfirmDialogGone(3000);
-    if (!gone) log('遗留确认框没有关闭，继续尝试处理当前岗位', 'warn');
+    let gone = await waitConfirmDialogGone(2500);
+
+    // 点按钮没关掉：先试 Esc，再试点另一个按钮
+    if (!gone) {
+      pressEscape();
+      gone = await waitConfirmDialogGone(1500);
+    }
+    if (!gone) {
+      const again = findAutoSentDialogButtons();
+      if (again) {
+        const other = again.continueBtn || again.stayBtn;
+        if (other) {
+          log('点击「留在此页」未生效，改点另一个按钮', 'warn');
+          await humanClick(other);
+          gone = await waitConfirmDialogGone(2000);
+        }
+      }
+    }
+    if (!gone) log('遗留确认框依然没有关闭，继续尝试处理当前岗位（若发生跳转会被自动弹回）', 'warn');
     return gone;
   }
 
@@ -1345,10 +1391,21 @@
           // 它既会遮挡点击，也会污染本次的"是否发送成功"判定。
           setAction(`点击打招呼：《${info.title}》`);
           await clearStaleSentDialog();
-          const opened = await openChatForCard(card, info);
-          if (!opened) {
+          const chat = await openChatForCard(card, info);
+
+          // 按钮显示「继续沟通/已发送」：此前已联系过。绝不能点——点了会跳到沟通页把任务带走。
+          if (chat.already) {
+            state.skippedCount += 1;
+            stat.chatted += 1;
+            seen.add(info.jobId);
+            await markSeen(info.jobId);
+            log(`跳过《${info.title}》@${info.company}：该岗位此前已联系过（按钮为「${chat.reason}」）`);
+            continue;
+          }
+
+          if (!chat.ok) {
             state.errorCount += 1;
-            log(`《${info.title}》@${info.company}：未找到打招呼按钮，跳过（下次会重试）`, 'warn');
+            log(`《${info.title}》@${info.company}：${chat.reason || '未找到打招呼按钮'}，跳过（下次会重试）`, 'warn');
             continue;
           }
 
