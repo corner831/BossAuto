@@ -402,6 +402,7 @@
     let salaryHint = '';
     let blocked = false;
     let note = '';
+    let alreadyChattedHint = false;
 
     try {
       const abs = new URL(info.href, location.href);
@@ -459,6 +460,20 @@
             const aboveMatch = detailText.match(/(\d{1,3})\s*K\s*以上/i);
             if (aboveMatch) salaryHint = `${aboveMatch[1]}K以上`;
           }
+
+          // 用服务端返回的详情页判断"是否已沟通过"。
+          // 列表页的按钮文案会被浏览器缓存（已沟通的岗位仍显示「立即沟通」），
+          // 但详情页是**现拉**的，更能反映真实状态。
+          const chatHints = (SEL.alreadyChattedTextHints || ['继续沟通', '已发送', '继续聊']);
+          try {
+            const exact = Array.from(doc.querySelectorAll('button, a, span')).some((el) => {
+              const t = (el.textContent || '').trim();
+              return chatHints.includes(t);
+            });
+            if (exact) alreadyChattedHint = true;
+          } catch (e) {
+            // 忽略
+          }
         } else if (outcome === 'blocked') {
           blocked = true;
           note = `被重定向到登录/验证页或被验证页替换（最终地址 ${finalUrl.slice(0, 90)}）`;
@@ -483,7 +498,7 @@
     }
 
     if (text.length > 6000) text = text.slice(0, 6000);
-    const out = { jd: text, salaryHint, blocked: false };
+    const out = { jd: text, salaryHint, blocked: false, alreadyChatted: alreadyChattedHint };
     state.jdCache.set(info.jobId, out);
     return out;
   }
@@ -809,7 +824,45 @@
     const stayBtn = pick(stayTexts) || null;
     const continueBtn = pick(contTexts) || null;
     if (!stayBtn && !continueBtn) return null;
-    return { stayBtn, continueBtn };
+
+    // 找到弹窗根节点：从按钮往上走，取"包含提示文案且体量不大"的那一层
+    let root = null;
+    let el = stayBtn || continueBtn;
+    for (let depth = 0; el && depth < 10; depth++, el = el.parentElement) {
+      const t = el.textContent || '';
+      if (t.length < 600 && hints.some((h) => t.includes(h))) {
+        root = el;
+        break;
+      }
+    }
+
+    return { stayBtn, continueBtn, root };
+  }
+
+  /** 在弹窗里（或整页）找右上角的关闭按钮 × */
+  function findDialogCloseIcon(rootEl) {
+    const SEL_CLOSE = ['.dialog-close', '.icon-close', '.close-btn', '.ui-icon-close', '[class*="close"]', '[aria-label="关闭"]', '[title="关闭"]'];
+    const scope = rootEl && rootEl.querySelectorAll ? rootEl : document;
+    for (const sel of SEL_CLOSE) {
+      try {
+        const el = scope.querySelector(sel);
+        if (el && isVisible(el)) return el;
+      } catch (e) {
+        // 忽略非法选择器
+      }
+    }
+    // 兜底：根节点本身可能是个 × 图标
+    try {
+      const alt = document.querySelectorAll(SEL_CLOSE.join(','));
+      for (const el of alt) {
+        if (!isVisible(el)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 40 && r.height <= 40) return el; // 小的方形图标，多半是 ×
+      }
+    } catch (e) {
+      // 忽略
+    }
+    return null;
   }
 
   /** 弹窗的可读描述，用于日志定位（出问题时把这段发回来就能判断） */
@@ -892,26 +945,25 @@
     if (!stale) return false;
     log(`检测到疑似遗留的确认框（${describeDialog(stale)}），先关闭它再继续`, 'warn');
 
+    // 降级顺序：点「留在此页」→ 点弹窗右上角 × → 汇报错误
     await humanClick(stale.stayBtn || stale.continueBtn);
     let gone = await waitConfirmDialogGone(2500);
 
-    // 点按钮没关掉：先试 Esc，再试点另一个按钮
     if (!gone) {
-      pressEscape();
-      gone = await waitConfirmDialogGone(1500);
-    }
-    if (!gone) {
-      const again = findAutoSentDialogButtons();
-      if (again) {
-        const other = again.continueBtn || again.stayBtn;
-        if (other) {
-          log('点击「留在此页」未生效，改点另一个按钮', 'warn');
-          await humanClick(other);
-          gone = await waitConfirmDialogGone(2000);
-        }
+      const cur = findAutoSentDialogButtons();
+      const closeIcon = findDialogCloseIcon(cur && cur.root ? cur.root : document);
+      if (closeIcon) {
+        log('点击「留在此页」未生效，改点弹窗右上角的 ×', 'warn');
+        await humanClick(closeIcon);
+        gone = await waitConfirmDialogGone(2500);
+      } else {
+        log('「留在此页」未生效，且没找到右上角关闭按钮', 'warn');
       }
     }
-    if (!gone) log('遗留确认框依然没有关闭，继续尝试处理当前岗位（若发生跳转会被自动弹回）', 'warn');
+
+    if (!gone) {
+      log('确认框无法关闭，汇报错误（若页面跳转，detail-guard 会自动弹回列表）', 'error');
+    }
     return gone;
   }
 
@@ -1322,6 +1374,17 @@
 
         if (needDetail) {
           const detail = await fetchJdInfo(info);
+
+          // 列表页按钮文案会被缓存（已沟通的岗位仍显示「立即沟通」），
+          // 但详情页是现拉的 —— 以它为准判断"是否已沟通过"。
+          if (detail.alreadyChatted) {
+            state.skippedCount += 1;
+            stat.chatted += 1;
+            seen.add(info.jobId);
+            await markSeen(info.jobId);
+            log(`跳过《${info.title}》@${info.company}：详情页显示该岗位已沟通过（列表按钮仍是缓存的「立即沟通」）`);
+            continue;
+          }
 
           let effectiveSalary = info.salary;
           if (effectiveSalary && !/\d/.test(effectiveSalary) && detail.salaryHint) {
