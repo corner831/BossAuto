@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "BOSS直聘自动投递助手",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "登录 BOSS 直聘后，一键搜索职位、抓取岗位详情、用大模型判断匹配度并自动打招呼投递。仅在你本地浏览器会话中运行，不采集或上传任何账号信息。",
   "permissions": ["storage", "scripting", "activeTab"],
   "host_permissions": ["https://www.zhipin.com/*", "https://api.deepseek.com/*"],

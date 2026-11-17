@@ -162,6 +162,65 @@ async function ensureEndpointPermission(endpoint) {
   }
 }
 
+// ---------- 日志面板：增量渲染 + 智能跟随 ----------
+// 说明：每次状态更新都把整个日志重建 + 强制滚到底，会让人没法回看。
+// 现在改成：只追加新行；只有"用户 5 秒内没有手动滚动过"并且本来就在底部附近时才自动跟随。
+const STORAGE_KEY_LOG_HEIGHT = 'ba_log_height';
+const AUTO_FOLLOW_IDLE_MS = 5000;
+let renderedLogTexts = [];
+let lastUserScrollAt = 0;
+let autoScrollAt = 0;
+
+function logLineNode(entry) {
+  const line = document.createElement('div');
+  line.className = `log-line ${entry.level || 'info'}`;
+  line.textContent = `[${entry.time}] ${entry.message}`;
+  return line;
+}
+
+function maybeAutoScroll() {
+  const panel = els.logPanel;
+  // 需求：只有"最近 5 秒内没有手动滚动过"才跟随新日志，
+  // 否则保持当前位置，方便回看。
+  if (Date.now() - lastUserScrollAt >= AUTO_FOLLOW_IDLE_MS) {
+    autoScrollAt = Date.now();
+    panel.scrollTop = panel.scrollHeight;
+  }
+}
+
+function renderLogs(logs) {
+  const list = logs || [];
+  const texts = list.map((e) => `[${e.time}] ${e.message}`);
+  const panel = els.logPanel;
+
+  // 用"上一批最后一行"在新列表里的下标做锚点：
+  // 后台只回传最近 50 条，窗口会滑动，用前缀比较会误判成"全变了"，
+  // 改成锚点后只追加真正新增的行，不会打断阅读。
+  let anchorIdx = -1;
+  if (renderedLogTexts.length > 0) {
+    anchorIdx = texts.lastIndexOf(renderedLogTexts[renderedLogTexts.length - 1]);
+  }
+
+  const tooMany = panel.childElementCount > 400;
+  if (anchorIdx < 0 || tooMany) {
+    // 新一轮任务（日志被清空）或节点过多：整体重建
+    panel.innerHTML = '';
+    for (const entry of list) panel.appendChild(logLineNode(entry));
+    renderedLogTexts = texts;
+    if (Date.now() - lastUserScrollAt >= AUTO_FOLLOW_IDLE_MS) {
+      autoScrollAt = Date.now();
+      panel.scrollTop = panel.scrollHeight;
+    }
+    return;
+  }
+
+  for (let i = anchorIdx + 1; i < list.length; i++) {
+    panel.appendChild(logLineNode(list[i]));
+  }
+  renderedLogTexts = texts;
+  maybeAutoScroll();
+}
+
 function renderState(state) {
   if (!state) return;
   els.appliedCount.textContent = state.appliedCount || 0;
@@ -176,14 +235,7 @@ function renderState(state) {
     : (state.fromHistory ? '上次记录' : '未运行');
   els.statusBadge.className = 'badge ' + (state.running ? 'running' : 'idle');
 
-  els.logPanel.innerHTML = '';
-  (state.log || []).forEach((entry) => {
-    const line = document.createElement('div');
-    line.className = `log-line ${entry.level || 'info'}`;
-    line.textContent = `[${entry.time}] ${entry.message}`;
-    els.logPanel.appendChild(line);
-  });
-  els.logPanel.scrollTop = els.logPanel.scrollHeight;
+  renderLogs(state.log);
 }
 
 async function refreshStateFromBackground() {
@@ -293,6 +345,25 @@ function formatSelfCheck(report) {
 
 async function init() {
   await loadSavedConfig();
+
+  // 记录"用户手动滚动日志"的时间，用来决定是否自动跟随新日志
+  els.logPanel.addEventListener('scroll', () => {
+    if (Date.now() - autoScrollAt < 200) return; // 我们自己滚的，不算用户操作
+    lastUserScrollAt = Date.now();
+  }, { passive: true });
+
+  // 日志面板高度可拖拽调整，并记住上次的高度
+  try {
+    const saved = await chrome.storage.local.get(STORAGE_KEY_LOG_HEIGHT);
+    const h = saved[STORAGE_KEY_LOG_HEIGHT];
+    if (h) els.logPanel.style.height = `${h}px`;
+  } catch (e) {
+    // 忽略
+  }
+  els.logPanel.addEventListener('mouseup', () => {
+    const h = els.logPanel.offsetHeight;
+    if (h > 80) chrome.storage.local.set({ [STORAGE_KEY_LOG_HEIGHT]: h }).catch(() => {});
+  });
 
   const tab = await getActiveJobTab();
   els.hint.classList.toggle('hidden', !!tab);
