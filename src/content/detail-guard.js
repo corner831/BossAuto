@@ -1,10 +1,12 @@
 // detail-guard.js
-// 只做一件事：如果上一次"整页跳转"是我们自己在点「打招呼」时误触发的，
-// 就把页面弹回职位列表，让主脚本能续跑，而不是让任务死在详情页上。
+// 只做一件事：如果这次整页跳转是我们点「打招呼」误触发的，
+// 就把页面**弹回跳转前的那个地址**（不是任务开始时的搜索地址），让主脚本续跑。
 //
-// 背景：BOSS 的职位卡片有时点击会触发整页跳转（JS 导航，不是 <a> 的默认行为），
-// 内容脚本会被销毁，从使用者角度看就是"页面自己刷新了、任务没了"。
-// 捕获阶段只能拦 <a> 的默认导航，拦不住 JS 主动跳转，所以这里做"事故后自愈"。
+// 背景：BOSS 有时在职位卡片上挂 JS 点击处理器直接跳转，这类导航不是 <a> 的默认行为，
+// content.js 里的 preventDefault 拦不住，脚本会被销毁。
+//
+// 不在本地做永久黑名单：只在本轮任务的 run state 里累加一个计数，任务结束就没了。
+// 因为无法判断是平台波动还是这个岗位本身的问题，不该永久排除任何岗位。
 
 (async function () {
   try {
@@ -16,23 +18,23 @@
     if (!unload.running) return;
     if (Date.now() - (unload.at || 0) > 30000) return; // 太久以前的事故不处理
 
-    // 只处理"点击打招呼/点击职位"这类我们自己造成的跳转
+    // 只处理我们自己点出来的跳转
     const action = unload.lastAction || '';
     if (!/点击打招呼|点击职位|打开详情/.test(action)) return;
 
-    // 记录这个岗位会把页面带跑，避免主脚本再次踩坑（否则会来回弹）
+    // 本轮任务内计数（任务结束随 run state 一起清空，不构成永久黑名单）
     const jobId = location.pathname;
-    const cur = await chrome.storage.local.get('ba_bounced_jobs');
-    const list = Array.isArray(cur.ba_bounced_jobs) ? cur.ba_bounced_jobs : [];
-    if (jobId && !list.includes(jobId)) {
-      list.push(jobId);
-      if (list.length > 200) list.splice(0, list.length - 200);
-      await chrome.storage.local.set({ ba_bounced_jobs: list });
-    }
+    const counts = run.bounceCounts && typeof run.bounceCounts === 'object' ? { ...run.bounceCounts } : {};
+    if (jobId) counts[jobId] = (counts[jobId] || 0) + 1;
+    await chrome.storage.local
+      .set({ ba_run_state: { ...run, bounceCounts: counts, updatedAt: Date.now() } })
+      .catch(() => {});
 
-    const back = run.searchUrl || '';
+    // 回到"跳转前"的地址：unload.href 是页面卸载瞬间的地址，
+    // 比任务开始时记录的 searchUrl 更贴近当时的状态（可能带了分页/筛选参数）。
+    const back = unload.href || run.searchUrl || '';
     if (back && /\/web\/geek\/job/.test(back) && back !== location.href) {
-      console.log('[BOSS自动投递] 检测到误触发的整页跳转，正在返回职位列表：', back);
+      console.log('[BOSS自动投递] 检测到误触发的整页跳转，正在返回跳转前页面：', back);
       location.replace(back);
     }
   } catch (e) {

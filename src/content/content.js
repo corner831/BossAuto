@@ -46,7 +46,9 @@
     jdBlockedCount: 0,
     lastGreetingAt: 0,
     lastAction: '',
-    searchUrl: ''
+    searchUrl: '',
+    // 本轮任务内"某个岗位导致整页跳转"的次数（任务结束即清空，不做永久黑名单）
+    bounceCounts: {}
   };
 
   // ---------- 基础工具 ----------
@@ -220,6 +222,7 @@
         // 记下任务开始时的职位列表地址：万一点击导致整页跳转，
         // detail-guard.js 可以据此把页面弹回来，让任务续跑。
         searchUrl: state.searchUrl || '',
+        bounceCounts: state.bounceCounts || {},
         updatedAt: Date.now()
       }
     }).catch(() => {});
@@ -1120,6 +1123,9 @@
       state.aiFailCount = resumeFrom.aiFailCount || 0;
       state.startedAt = resumeFrom.startedAt || Date.now();
       state.searchUrl = resumeFrom.searchUrl || location.href;
+      state.bounceCounts = resumeFrom.bounceCounts && typeof resumeFrom.bounceCounts === 'object'
+        ? { ...resumeFrom.bounceCounts }
+        : {};
       state.log = [];
       log(`检测到页面刷新/跳转，自动继续上次任务（已投递 ${state.appliedCount} 个）`);
     } else {
@@ -1172,13 +1178,6 @@
     }
 
     const seen = await loadSeenIds();
-
-    // 曾经因为点这个岗位导致整页跳转的，直接跳过——否则每次都会把任务打断一次
-    const bouncedData = await chrome.storage.local.get('ba_bounced_jobs');
-    const bounced = new Set(Array.isArray(bouncedData.ba_bounced_jobs) ? bouncedData.ba_bounced_jobs : []);
-    if (bounced.size > 0) {
-      log(`已知有 ${bounced.size} 个岗位点击会触发整页跳转，本轮会直接跳过它们`, 'warn');
-    }
     let page = 1;
     let round = 1;
 
@@ -1312,11 +1311,12 @@
         }
 
         try {
-          if (bounced.has(info.jobId)) {
+          // 只对本轮做防死循环：同一岗位连续把页面带跑 ≥3 次就先放过，
+          // 但**不做永久黑名单**（不写入已处理记录），下次运行照样会重新尝试。
+          const bouncedTimes = (state.bounceCounts && state.bounceCounts[info.jobId]) || 0;
+          if (bouncedTimes >= 3) {
             stat.ruleSkip += 1;
-            seen.add(info.jobId);
-            await markSeen(info.jobId);
-            log(`跳过《${info.title}》@${info.company}：该岗位点击会导致整页跳转，为避免打断任务直接跳过`, 'warn');
+            log(`跳过《${info.title}》@${info.company}：本轮已连续 ${bouncedTimes} 次点击导致整页跳转，先放过它（下次运行会重新尝试）`, 'warn');
             continue;
           }
 
