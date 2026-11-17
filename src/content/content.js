@@ -132,14 +132,34 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  // 可被"停止"打断的等待（用于定时刷新的长等待）
-  async function interruptibleSleep(ms) {
-    const step = 500;
-    let waited = 0;
-    while (waited < ms && !state.stopRequested) {
-      await sleep(Math.min(step, ms - waited));
-      waited += step;
-    }
+  // 等待期间可被「停止」立即唤醒的等待者集合
+  const stopWaiters = new Set();
+
+  /**
+   * 可被「停止」立即打断的等待。
+   *
+   * 早期实现是 `while (...) await sleep(500)` 的**链式短定时器**：
+   * 等 1 分钟要串 120 个 timer。浏览器对后台标签页的定时器会节流
+   * （隐藏页最小 1 秒，长时间隐藏后更是每分钟才跑一次），
+   * 结果 1 分钟的等待变成十几分钟甚至更久——用户看到的就是「等待不结束」。
+   *
+   * 现在改成**单个长定时器**（不节流的整数倍不会被链式节流放大），
+   * 「停止」通过 stopWaiters 直接唤醒，不需要轮询。
+   */
+  function interruptibleSleep(ms) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        stopWaiters.delete(finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, Math.max(0, ms));
+      stopWaiters.add(finish);
+      if (state.stopRequested) finish();
+    });
   }
 
   function randomDelay(minMs, maxMs) {
@@ -1339,29 +1359,51 @@
       log(nav.reachedEnd ? `翻页结束：${nav.reason}` : `翻页失败：${nav.reason}`, nav.reachedEnd ? 'info' : 'warn');
 
       // 「定时刷新捞新岗位」：一轮翻完后等待 N 分钟，重新搜索，靠历史记录只投新的
-      if (config.refreshEnabled && config.refreshIntervalMin > 0) {
-        if (state.appliedCount >= maxApplications) return;
-        log(`等待 ${config.refreshIntervalMin} 分钟后重新搜索新岗位（点"停止"可立即结束）...`);
-        await interruptibleSleep(config.refreshIntervalMin * 60 * 1000);
-        if (state.stopRequested) return;
+      if (!(config.refreshEnabled && config.refreshIntervalMin > 0)) return;
 
-        round += 1;
-        page = 1;
-        log(`第 ${round} 轮：重新搜索「${(config.keywords && config.keywords[0]) || '当前列表'}」以获取新发布的岗位...`);
-        if (config.keywords && config.keywords.length > 0) {
-          await performSearch(config.keywords[0]);
-        } else {
-          // 没有关键词时只能靠刷新页面重新拉列表；先落盘，reload 后由注入逻辑续跑
-          state.preserveRunState = true;
-          await persistRunState();
-          location.reload();
-          return;
-        }
-        await sleep(1000);
-        continue;
+      if (state.appliedCount >= maxApplications) {
+        log('已达「单次最多投递数」上限，本次不再等待新岗位', 'info');
+        return;
       }
 
-      return;
+      const waitMinutes = Math.max(1, Number(config.refreshIntervalMin) || 10);
+      const waitMs = waitMinutes * 60 * 1000;
+      log(`等待 ${waitMinutes} 分钟后重新搜索新岗位（点"停止"可立即结束）...`);
+      const waitStart = Date.now();
+      await interruptibleSleep(waitMs);
+      if (state.stopRequested) return;
+      log(`等待结束（实际等待 ${Math.round((Date.now() - waitStart) / 1000)} 秒），开始重新搜索新岗位...`);
+
+      round += 1;
+      page = 1;
+      log(`第 ${round} 轮：重新搜索「${(config.keywords && config.keywords[0]) || '当前列表'}」以获取新发布的岗位...`);
+      if (config.keywords && config.keywords.length > 0) {
+        await performSearch(config.keywords[0]);
+      } else {
+        // 没有关键词时只能靠刷新页面重新拉列表；先落盘，reload 后由注入逻辑续跑
+        state.preserveRunState = true;
+        await persistRunState();
+        location.reload();
+        return;
+      }
+      await sleep(1000);
+
+      // 把"这一轮到底有没有捞到新岗位"说清楚，避免用户以为功能没生效
+      const afterCards = getJobCards();
+      let freshCount = 0;
+      for (const c of afterCards) {
+        try {
+          const i = extractJobInfo(c);
+          if (i.title && !seen.has(i.jobId)) freshCount += 1;
+        } catch (e) {
+          // 忽略
+        }
+      }
+      log(
+        `重新搜索完成：当前 ${afterCards.length} 个岗位，其中未处理过 ${freshCount} 个` +
+        (freshCount === 0 ? '（暂无新岗位，继续等待下一轮）' : '')
+      );
+      continue;
     }
   }
 
@@ -1494,6 +1536,11 @@
       state.running = false;
       stopKeepAlive();
       clearRunState();
+      // 立刻唤醒正在等待的 interruptibleSleep（否则长等待要等定时器自然到期）
+      stopWaiters.forEach((fn) => {
+        try { fn(); } catch (e) { /* 忽略 */ }
+      });
+      stopWaiters.clear();
       log('收到停止指令，正在结束当前任务...', 'warn');
       sendResponse({ ok: true });
       return true;
