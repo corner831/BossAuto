@@ -31,6 +31,9 @@ const BOSS_SELECTORS = {
   // 卡片内：职位描述简介（如果列表页有展示）
   jobDesc: ['.info-desc', '.job-desc'],
 
+  // 卡片内：工作地点（实测 span.company-location）
+  companyLocation: ['.company-location', '.job-area', '.company-text .location'],
+
   // 卡片上直接可点击的"打招呼/立即沟通"按钮。
   // 重要：实测 2026-11 的列表页卡片默认**不含**任何招呼按钮，鼠标悬停后才会渲染出来，
   // 所以 content.js 会先派发 hover 事件再查找，这里多备几套候选。

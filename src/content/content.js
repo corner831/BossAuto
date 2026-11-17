@@ -43,7 +43,8 @@
     keepAliveTimer: null,
     jdCache: new Map(),
     salaryWarned: false,
-    jdBlockedCount: 0
+    jdBlockedCount: 0,
+    lastGreetingAt: 0
   };
 
   // ---------- 基础工具 ----------
@@ -184,7 +185,15 @@
     return SIG(getJobCards().map(getCardHref));
   }
 
-  function buildJobId(href, title, company, salary) {
+  /**
+   * 计算岗位去重 ID。
+   *
+   * 主键用详情页路径（稳定、唯一）。只有在拿不到链接时才走兜底，
+   * 而兜底不能只看标题——同名岗位（比如一堆"产品经理"）会撞成一个 ID，
+   * 后面的真岗位就被当成"已处理"静默跳过了。所以兜底要把
+   * 标题 + 公司 + 薪资 + 地点 + 标签 全部拼进去。
+   */
+  function buildJobId(href, title, company, salary, location, tagsText) {
     // 职位详情链接通常带有 lid / securityId 等每次搜索都会变化的追踪参数，
     // 必须只取路径部分作为稳定 ID，否则同一个职位每次搜索都会被当成"新职位"，
     // 导致重复打招呼。
@@ -196,23 +205,28 @@
         // 不是合法 URL，走兜底方案
       }
     }
-    return `${title}__${company}__${salary}`;
+    const parts = [title, company, salary, location, tagsText]
+      .map((x) => String(x || '').trim())
+      .filter(Boolean);
+    return `sig:${parts.join('__')}`;
   }
 
   function extractJobInfo(card) {
     const titleEl = queryFirst(card, SEL.jobTitle);
     const companyEl = queryFirst(card, SEL.companyName);
     const salaryEl = queryFirst(card, SEL.jobSalary);
+    const locationEl = queryFirst(card, SEL.companyLocation || []);
     const tagsEls = queryAllFirst(card, SEL.jobTags);
     const href = getCardHref(card);
 
     const title = titleEl ? titleEl.textContent.trim() : '';
     const company = companyEl ? companyEl.textContent.trim() : '';
     const salary = salaryEl ? salaryEl.textContent.trim() : '';
+    const location = locationEl ? locationEl.textContent.trim() : '';
     const tagsText = tagsEls.map((el) => el.textContent.trim()).join(' ');
-    const jobId = buildJobId(href, title, company, salary);
+    const jobId = buildJobId(href, title, company, salary, location, tagsText);
 
-    return { jobId, title, company, salary, tagsText, href };
+    return { jobId, title, company, salary, location, tagsText, href };
   }
 
   async function loadSeenIds() {
@@ -286,9 +300,20 @@
     return true;
   }
 
+  /**
+   * 卡片是否"已经沟通过"。
+   *
+   * 不能用 `card.textContent.includes(hint)` —— 那是整张卡片的文本，
+   * 标题/描述里出现"继续沟通"这类词就会被误判成已沟通，从而静默跳过岗位。
+   * 现在要求：必须是**可见的**按钮/链接/文本节点，且文本完全等于提示词。
+   */
   function isCardAlreadyChatted(card) {
-    const text = card.textContent || '';
-    return SEL.alreadyChattedTextHints.some((hint) => text.includes(hint));
+    const hints = SEL.alreadyChattedTextHints || [];
+    if (!hints.length) return false;
+    return Array.from(card.querySelectorAll('button, a, span, div')).some((el) => {
+      if (!isVisible(el)) return false;
+      return hints.includes((el.textContent || '').trim());
+    });
   }
 
   // ---------- 职位详情（JD）抓取 ----------
@@ -693,22 +718,82 @@
     return { stayBtn, continueBtn };
   }
 
+  /** 弹窗的可读描述，用于日志定位（出问题时把这段发回来就能判断） */
+  function describeDialog(d) {
+    if (!d) return '无';
+    const parts = [];
+    const btn = d.stayBtn || d.continueBtn;
+    if (btn) {
+      parts.push(`按钮="${(btn.textContent || '').trim()}"`);
+      try {
+        const r = btn.getBoundingClientRect();
+        parts.push(`位置=${Math.round(r.x)},${Math.round(r.y)}`);
+      } catch (e) { /* 忽略 */ }
+    }
+    let root = btn ? btn.parentElement : null;
+    for (let i = 0; root && i < 6; i++, root = root.parentElement) {
+      const t = (root.textContent || '').trim();
+      if (t.length > 20) { parts.push(`文案="${t.slice(0, 40).replace(/\s+/g, ' ')}…"`); break; }
+    }
+    return parts.join(' | ') || '未知';
+  }
+
+  /**
+   * 确认框是否仍然存在。
+   *
+   * 光看"有没有按钮"不够：关闭动画期间按钮可能先被判为不可见，
+   * 于是误判成"已关闭"（这就是上一版成功日志与实际不符的原因）。
+   * 这里额外要求标题文案也从可见文本里消失。
+   */
+  function isConfirmDialogPresent() {
+    if (findAutoSentDialogButtons()) return true;
+    const t = document.body.innerText || '';
+    return t.includes('已向BOSS发送消息');
+  }
+
+  /**
+   * 等待确认框消失，并且**连续 600ms 都判定为不存在**才算真的关了。
+   * 单点采样会被动画/重渲染骗过去。
+   */
+  async function waitConfirmDialogGone(timeout = 3500) {
+    const start = Date.now();
+    let goneSince = 0;
+    while (Date.now() - start < timeout) {
+      if (state.stopRequested) return false;
+      if (isConfirmDialogPresent()) {
+        goneSince = 0;
+      } else {
+        if (!goneSince) goneSince = Date.now();
+        else if (Date.now() - goneSince >= 600) return true;
+      }
+      await sleep(150);
+    }
+    return false;
+  }
+
   /**
    * 清掉上一个岗位遗留的「已向BOSS发送消息」确认框。
    *
-   * **必须在点击「打招呼」之前调用**。
-   * 曾经把它放在 sendGreeting() 开头，结果 `openChatForCard()` 刚点开的、
-   * 属于本岗位的弹窗被当成"遗留弹窗"关掉了，随后自然等不到输入框 → 误判失败。
+   * **必须在点击「打招呼」之前调用**（放在 sendGreeting 里会把本岗位刚弹出的框关掉）。
+   * 另外加了时间保护：刚投递完 6 秒内出现的弹窗，很可能就是刚才那次产生的，
+   * 不去动它，避免"把正常投递的弹窗当遗留关掉"。
    */
   async function clearStaleSentDialog() {
+    if (Date.now() - (state.lastGreetingAt || 0) < 6000) {
+      const justNow = findAutoSentDialogButtons();
+      if (justNow) return false; // 刚发完，先不动，交给下一轮判断
+    }
     const stale = findAutoSentDialogButtons();
     if (!stale) return false;
-    log('检测到上一个岗位遗留的「已向BOSS发送消息」弹窗，先关闭它再继续', 'warn');
+    log(`检测到疑似遗留的确认框（${describeDialog(stale)}），先关闭它再继续`, 'warn');
     await humanClick(stale.stayBtn || stale.continueBtn);
-    return await waitFor(() => !findAutoSentDialogButtons(), { timeout: 3000 });
+    const gone = await waitConfirmDialogGone(3000);
+    if (!gone) log('遗留确认框没有关闭，继续尝试处理当前岗位', 'warn');
+    return gone;
   }
 
   async function sendGreeting(greetingText) {
+    state.lastGreetingAt = Date.now();
     // 点击"打招呼"后，BOSS 可能出现两种情况，谁先出现处理谁：
     // 1) 一个可编辑的聊天输入框 —— 我们填入自定义话术并发送；
     // 2) 一个"已向BOSS发送消息"确认框 —— 说明 BOSS 已经用你在官方设置里配置的
@@ -732,14 +817,16 @@
       const btn = outcome.dialog.stayBtn || outcome.dialog.continueBtn;
       await humanClick(btn);
 
-      // 关键：确认弹窗**真的关掉了**才算发出去了。
-      // 关不掉通常意味着这次点击没生效，此时不能谎报成功——否则下一个岗位会连环误判。
-      let closed = await waitFor(() => !findAutoSentDialogButtons(), { timeout: 3000 });
+      // 关键：确认弹窗**持续消失**才算发出去了。
+      // 单点采样会被关闭动画骗过去（按钮先不可见、但弹窗还在），
+      // 那样会在没发出去的情况下记成功，下一轮再把真弹窗当遗留关掉。
+      let closed = await waitConfirmDialogGone(3500);
       if (!closed) {
         const again = findAutoSentDialogButtons();
         if (again) await humanClick(again.stayBtn || again.continueBtn);
-        closed = await waitFor(() => !findAutoSentDialogButtons(), { timeout: 2500 });
+        closed = await waitConfirmDialogGone(3000);
       }
+      state.lastGreetingAt = Date.now();
       if (!closed) {
         return { ok: false, reason: '「已向BOSS发送消息」确认框没有关闭，无法确认消息是否真的发出' };
       }
@@ -934,6 +1021,7 @@
     state.jdCache = new Map();
     state.salaryWarned = false;
     state.jdBlockedCount = 0;
+    state.lastGreetingAt = 0;
   }
 
   async function runAutomation(config, { resumeFrom = null } = {}) {
