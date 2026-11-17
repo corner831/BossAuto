@@ -1128,6 +1128,27 @@
         : {};
       state.log = [];
       log(`检测到页面刷新/跳转，自动继续上次任务（已投递 ${state.appliedCount} 个）`);
+
+      // 上一跳落到了职位详情页，detail-guard 可能在那边已经补投成功——这里认领这次结果
+      try {
+        const d = await chrome.storage.local.get('ba_detail_delivery');
+        const rec = d.ba_detail_delivery;
+        if (rec && Date.now() - (rec.at || 0) < 120000) {
+          const name = `《${rec.title || rec.jobId}》`;
+          if (rec.ok) {
+            state.appliedCount += 1;
+            log(`整页跳转后已在详情页补投${name}${rec.already ? '（该岗位此前已联系过，不重复打扰）' : ''}`, 'success');
+            if (rec.jobId) await markSeen(rec.jobId);
+          } else {
+            state.errorCount += 1;
+            log(`整页跳转后未能在详情页补投${name}：${rec.reason || '未知原因'}（下次运行会重试）`, 'warn');
+          }
+          await chrome.storage.local.remove('ba_detail_delivery');
+          await persistRunState();
+        }
+      } catch (e) {
+        // 忽略
+      }
     } else {
       resetCounters();
       state.startedAt = Date.now();
