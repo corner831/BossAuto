@@ -45,7 +45,8 @@
     salaryWarned: false,
     jdBlockedCount: 0,
     lastGreetingAt: 0,
-    lastAction: ''
+    lastAction: '',
+    searchUrl: ''
   };
 
   // ---------- 基础工具 ----------
@@ -216,6 +217,9 @@
         aiFailCount: state.aiFailCount,
         startedAt: state.startedAt,
         stopRequested: state.stopRequested,
+        // 记下任务开始时的职位列表地址：万一点击导致整页跳转，
+        // detail-guard.js 可以据此把页面弹回来，让任务续跑。
+        searchUrl: state.searchUrl || '',
         updatedAt: Date.now()
       }
     }).catch(() => {});
@@ -670,7 +674,7 @@
     }
   }
 
-  async function openChatForCard(card) {
+  async function openChatForCard(card, info) {
     // 1) 少数卡片样式默认就带按钮
     let chatBtn = queryFirst(card, SEL.cardChatButton) || findByText(card, 'button, a, span', ['打招呼', '立即沟通']);
 
@@ -703,14 +707,19 @@
     }
 
     if (chatBtn) {
+      setAction(`点击打招呼按钮：《${(info && info.title) || ''}》`);
       await humanClick(chatBtn);
       return true;
     }
 
     // 4) 兜底：点卡片唤出详情面板。
-    //    这里有风险——如果卡片实际是链接，点击会整页跳转把脚本上下文销毁。
-    //    所以点完立刻复核卡片数量：列表消失/数量变化就判定为跳转，放弃该职位以保住任务。
+    //    风险：BOSS 有时会在卡片上挂 JS 点击处理器并直接整页跳转，
+    //    这种情况 <a> 的 preventDefault 拦不住，脚本会被销毁。
+    //    这里先用"卡片里是否有 job_detail 链接"预判，把动作标签写清楚，
+    //    真跳走了 detail-guard.js 会把页面弹回来并把这个岗位加入跳过名单。
+    const hasDetailLink = !!card.querySelector('a[href*="/job_detail/"]');
     const beforeCount = getJobCards().length;
+    setAction(`点击职位卡片：《${(info && info.title) || ''}》${hasDetailLink ? '（含详情链接，可能跳转）' : ''}`);
     fireHover(card);
     await humanClick(card);
     await sleep(700);
@@ -724,6 +733,7 @@
     chatBtn = findByText(document, 'button, a, span', ['打招呼', '立即沟通']);
     if (!chatBtn) return false;
 
+    setAction(`点击详情面板里的打招呼：《${(info && info.title) || ''}》`);
     await humanClick(chatBtn);
     return true;
   }
@@ -1109,11 +1119,13 @@
       state.scoredCount = resumeFrom.scoredCount || 0;
       state.aiFailCount = resumeFrom.aiFailCount || 0;
       state.startedAt = resumeFrom.startedAt || Date.now();
+      state.searchUrl = resumeFrom.searchUrl || location.href;
       state.log = [];
       log(`检测到页面刷新/跳转，自动继续上次任务（已投递 ${state.appliedCount} 个）`);
     } else {
       resetCounters();
       state.startedAt = Date.now();
+      state.searchUrl = location.href;
       log('开始自动投递任务');
     }
 
@@ -1160,6 +1172,13 @@
     }
 
     const seen = await loadSeenIds();
+
+    // 曾经因为点这个岗位导致整页跳转的，直接跳过——否则每次都会把任务打断一次
+    const bouncedData = await chrome.storage.local.get('ba_bounced_jobs');
+    const bounced = new Set(Array.isArray(bouncedData.ba_bounced_jobs) ? bouncedData.ba_bounced_jobs : []);
+    if (bounced.size > 0) {
+      log(`已知有 ${bounced.size} 个岗位点击会触发整页跳转，本轮会直接跳过它们`, 'warn');
+    }
     let page = 1;
     let round = 1;
 
@@ -1293,11 +1312,19 @@
         }
 
         try {
+          if (bounced.has(info.jobId)) {
+            stat.ruleSkip += 1;
+            seen.add(info.jobId);
+            await markSeen(info.jobId);
+            log(`跳过《${info.title}》@${info.company}：该岗位点击会导致整页跳转，为避免打断任务直接跳过`, 'warn');
+            continue;
+          }
+
           // 点击「打招呼」之前先清掉上一个岗位可能遗留的确认框：
           // 它既会遮挡点击，也会污染本次的"是否发送成功"判定。
           setAction(`点击打招呼：《${info.title}》`);
           await clearStaleSentDialog();
-          const opened = await openChatForCard(card);
+          const opened = await openChatForCard(card, info);
           if (!opened) {
             state.errorCount += 1;
             log(`《${info.title}》@${info.company}：未找到打招呼按钮，跳过（下次会重试）`, 'warn');
@@ -1573,7 +1600,11 @@
         const ago = Math.round((Date.now() - rec.at) / 1000);
         const where = rec.lastAction ? `「${rec.lastAction}」` : '未知步骤';
         if (rec.href && rec.href !== location.href) {
-          log(`上次任务在${where}时页面发生了跳转（${ago} 秒前，已投递 ${rec.applied} 个），当前地址与跳转前不同`, 'warn');
+          let samePath = false;
+          try { samePath = new URL(rec.href).pathname === new URL(location.href).pathname; } catch (e) { /* 忽略 */ }
+          log(`上次任务在${where}时页面发生了整页跳转（${ago} 秒前，已投递 ${rec.applied} 个）`, 'warn');
+          log(`  跳转前：${String(rec.href).slice(0, 150)}`, 'warn');
+          log(`  跳转后：${location.href.slice(0, 150)}${samePath ? '（同一页面，仅参数变化）' : '（页面已不同）'}`, 'warn');
         } else {
           log(`上次任务在${where}时页面被重新加载（${ago} 秒前，已投递 ${rec.applied} 个）`, 'warn');
         }
