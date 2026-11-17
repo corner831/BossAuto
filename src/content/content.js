@@ -639,13 +639,73 @@
     return true;
   }
 
+  /** 元素是否真的可见（有占位、未被隐藏） */
+  function isVisible(el) {
+    if (!el) return false;
+    try {
+      const r = el.getBoundingClientRect();
+      if (r.width <= 1 || r.height <= 1) return false;
+      const st = getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden') return false;
+      if (Number(st.opacity) === 0) return false;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * 找「已向BOSS发送消息」确认框。
+   *
+   * 必须要求**可见**，这是判断"真的发出去了"的前提。早期实现有三个缺陷：
+   * 1) 用 `document.body.textContent` 匹配——隐藏节点、聊天记录里的旧文案也会命中；
+   * 2) 按钮在**全文档**范围内找——可能点到别的卡片上的"继续沟通"；
+   * 3) 点完立刻返回成功——上一个岗位的弹窗没关掉时，下一个岗位就会"秒成功"，
+   *    于是日志显示已投递、BOSS 实际没收到。
+   */
   function findAutoSentDialogButtons() {
-    const hasDialogText = SEL.autoSentDialogHints.some((hint) => document.body.textContent.includes(hint));
-    if (!hasDialogText) return null;
-    const stayBtn = findByText(document, 'button, span, a, div', SEL.autoSentDialogStayButtonTexts);
-    const continueBtn = findByText(document, 'button, span, a, div', SEL.autoSentDialogContinueButtonTexts);
+    const hints = SEL.autoSentDialogHints || [];
+    const stayTexts = SEL.autoSentDialogStayButtonTexts || [];
+    const contTexts = SEL.autoSentDialogContinueButtonTexts || [];
+
+    // innerText 只包含"可见"文本，隐藏节点里的旧文案不会误命中
+    const visibleText = document.body.innerText || '';
+    if (!hints.some((h) => visibleText.includes(h))) return null;
+
+    const allBtns = Array.from(document.querySelectorAll('button, a, span'));
+    const pick = (texts) =>
+      allBtns.find((b) => {
+        if (!isVisible(b)) return false;
+        if (!texts.includes((b.textContent || '').trim())) return false;
+        // 按钮必须位于一个"同时包含提示文字、且体量不大"的容器里，
+        // 以此排除列表卡片上的同名按钮
+        let el = b;
+        for (let depth = 0; el && depth < 8; depth++, el = el.parentElement) {
+          const t = el.textContent || '';
+          if (t.length < 600 && hints.some((h) => t.includes(h))) return true;
+        }
+        return false;
+      });
+
+    const stayBtn = pick(stayTexts) || null;
+    const continueBtn = pick(contTexts) || null;
     if (!stayBtn && !continueBtn) return null;
     return { stayBtn, continueBtn };
+  }
+
+  /**
+   * 清掉上一个岗位遗留的「已向BOSS发送消息」确认框。
+   *
+   * **必须在点击「打招呼」之前调用**。
+   * 曾经把它放在 sendGreeting() 开头，结果 `openChatForCard()` 刚点开的、
+   * 属于本岗位的弹窗被当成"遗留弹窗"关掉了，随后自然等不到输入框 → 误判失败。
+   */
+  async function clearStaleSentDialog() {
+    const stale = findAutoSentDialogButtons();
+    if (!stale) return false;
+    log('检测到上一个岗位遗留的「已向BOSS发送消息」弹窗，先关闭它再继续', 'warn');
+    await humanClick(stale.stayBtn || stale.continueBtn);
+    return await waitFor(() => !findAutoSentDialogButtons(), { timeout: 3000 });
   }
 
   async function sendGreeting(greetingText) {
@@ -653,6 +713,9 @@
     // 1) 一个可编辑的聊天输入框 —— 我们填入自定义话术并发送；
     // 2) 一个"已向BOSS发送消息"确认框 —— 说明 BOSS 已经用你在官方设置里配置的
     //    默认招呼语直接发出去了，这里的自定义话术不会生效，只能确认并关闭继续下一个。
+    //
+    // 注意：这里**不能**再清理"遗留弹窗"——此刻页面上的弹窗是本次点击刚产生的。
+    // 残留清理见 clearStaleSentDialog()，由调用方在点击前执行。
     const outcome = await waitFor(() => {
       const input = queryFirst(document, SEL.chatInput);
       if (input) return { type: 'input', input };
@@ -668,7 +731,19 @@
     if (outcome.type === 'auto-sent') {
       const btn = outcome.dialog.stayBtn || outcome.dialog.continueBtn;
       await humanClick(btn);
-      return { ok: true, usedDefaultGreeting: true };
+
+      // 关键：确认弹窗**真的关掉了**才算发出去了。
+      // 关不掉通常意味着这次点击没生效，此时不能谎报成功——否则下一个岗位会连环误判。
+      let closed = await waitFor(() => !findAutoSentDialogButtons(), { timeout: 3000 });
+      if (!closed) {
+        const again = findAutoSentDialogButtons();
+        if (again) await humanClick(again.stayBtn || again.continueBtn);
+        closed = await waitFor(() => !findAutoSentDialogButtons(), { timeout: 2500 });
+      }
+      if (!closed) {
+        return { ok: false, reason: '「已向BOSS发送消息」确认框没有关闭，无法确认消息是否真的发出' };
+      }
+      return { ok: true, usedDefaultGreeting: true, verifiedBy: '确认框已关闭' };
     }
 
     const input = outcome.input;
@@ -685,7 +760,23 @@
       input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
     }
 
-    return { ok: true };
+    // 发送后校验：输入框被清空（常见行为）或出现了确认框，都算发出。
+    // 两者都没有时不敢断言成功，标记为"未确认"——不计入成功、也不拉黑。
+    const confirmed = await waitFor(() => {
+      const el = queryFirst(document, SEL.chatInput) || input;
+      const cleared = !el || !(el.value || '').trim();
+      if (cleared) return 'cleared';
+      if (findAutoSentDialogButtons()) return 'dialog';
+      return null;
+    }, { timeout: 3000 });
+
+    if (confirmed === 'cleared') return { ok: true, verifiedBy: '输入框已清空' };
+    if (confirmed === 'dialog') {
+      const d = findAutoSentDialogButtons();
+      if (d) await humanClick(d.stayBtn || d.continueBtn);
+      return { ok: true, verifiedBy: '出现发送确认框' };
+    }
+    return { ok: true, unverified: true, verifiedBy: '未确认（输入框未清空、也无确认框）' };
   }
 
   // ---------- 翻页 ----------
@@ -1048,6 +1139,9 @@
         }
 
         try {
+          // 点击「打招呼」之前先清掉上一个岗位可能遗留的确认框：
+          // 它既会遮挡点击，也会污染本次的"是否发送成功"判定。
+          await clearStaleSentDialog();
           const opened = await openChatForCard(card);
           if (!opened) {
             state.errorCount += 1;
@@ -1059,10 +1153,16 @@
           if (result.ok) {
             state.appliedCount += 1;
             stat.applied += 1;
-            const note = result.usedDefaultGreeting
-              ? '（该职位使用了 BOSS 自带的默认招呼语，未能填入自定义话术，可在 BOSS「消息通知-设置招呼语」里修改默认文案）'
-              : '';
-            log(`已投递《${info.title}》@${info.company}（${info.salary}）${note}`, 'success');
+            const notes = [];
+            if (result.usedDefaultGreeting) {
+              notes.push('BOSS 默认招呼语，未用自定义话术；可在 BOSS「消息通知-设置招呼语」里改默认文案');
+            }
+            if (result.unverified) notes.push('未确认送达，建议去 BOSS 消息里核对');
+            const note = notes.length ? `（${notes.join('；')}）` : '';
+            log(
+              `${result.unverified ? '疑似已投递' : '已投递'}《${info.title}》@${info.company}（${info.salary}）${note}`,
+              result.unverified ? 'warn' : 'success'
+            );
             seen.add(info.jobId);
             await markSeen(info.jobId);
             await persistRunState();
