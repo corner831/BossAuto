@@ -47,6 +47,8 @@
     lastGreetingAt: 0,
     lastAction: '',
     searchUrl: '',
+    // 本轮已抓取详情页的次数（用于每 N 条插一次较长停顿，降低风控概率）
+    jdFetchCount: 0,
     // 本轮任务内"某个岗位导致整页跳转"的次数（任务结束即清空，不做永久黑名单）
     bounceCounts: {}
   };
@@ -414,7 +416,19 @@
       // 结果详情页少了这些参数，更容易被服务端判成异常访问。
       abs.hash = '';
 
-      await sleep(randomDelay(300, 900));
+      // 抓详情页是这个插件里"最重"的动作：一开 AI 打分，每条候选岗位都要访问一次
+      // 详情页。密集抓取最容易触发 BOSS 的风控（表现为 URL 被追加 &_security_check= 并整页重载）。
+      // 因此这里放慢节奏：
+      //   · 单次间隔 1.5~3 秒
+      //   · 每连续抓 8 条，额外歇 6~12 秒，模拟"看几条再翻页"的节奏
+      await sleep(randomDelay(1500, 3000));
+      state.jdFetchCount = (state.jdFetchCount || 0) + 1;
+      if (state.jdFetchCount % 8 === 0) {
+        const pause = randomDelay(6000, 12000);
+        log(`已连续抓取 ${state.jdFetchCount} 条职位详情，歇 ${Math.round(pause / 1000)} 秒再继续（降低风控风险）`);
+        await interruptibleSleep(pause);
+        if (state.stopRequested) return { jd: '', salaryHint: '', blocked: false, alreadyChatted: false };
+      }
 
       const res = await fetch(abs.href, {
         credentials: 'include',
@@ -1197,6 +1211,7 @@
     state.jdCache = new Map();
     state.salaryWarned = false;
     state.jdBlockedCount = 0;
+    state.jdFetchCount = 0;
     state.lastGreetingAt = 0;
   }
 
