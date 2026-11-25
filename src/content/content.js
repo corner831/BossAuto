@@ -419,9 +419,9 @@
       // 抓详情页是这个插件里"最重"的动作：一开 AI 打分，每条候选岗位都要访问一次
       // 详情页。密集抓取最容易触发 BOSS 的风控（表现为 URL 被追加 &_security_check= 并整页重载）。
       // 因此这里放慢节奏：
-      //   · 单次间隔 1.5~3 秒
+      //   · 单次间隔 2~3 秒
       //   · 每连续抓 8 条，额外歇 6~12 秒，模拟"看几条再翻页"的节奏
-      await sleep(randomDelay(1500, 3000));
+      await sleep(randomDelay(2000, 3000));
       state.jdFetchCount = (state.jdFetchCount || 0) + 1;
       if (state.jdFetchCount % 8 === 0) {
         const pause = randomDelay(6000, 12000);
